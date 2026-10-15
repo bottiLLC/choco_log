@@ -2,7 +2,7 @@
 
 ![CI](https://img.shields.io/badge/CI-passing-brightgreen)
 ![Python](https://img.shields.io/badge/Python-3.14%20%7C%203.13-blue.svg)
-![Streamlit](https://img.shields.io/badge/Streamlit-1.40.0-FF4B4B.svg)
+![Streamlit](https://img.shields.io/badge/Streamlit-1.66.0-FF4B4B.svg)
 ![License](https://img.shields.io/badge/License-MIT-yellow.svg)
 
 ## Overview

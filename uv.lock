@@ -269,7 +269,7 @@ requires-dist = [
     { name = "pytest-cov", marker = "extra == 'dev'", specifier = ">=5.0.0" },
     { name = "python-dotenv", specifier = ">=1.0.0" },
     { name = "ruff", marker = "extra == 'dev'", specifier = ">=0.8.0" },
-    { name = "streamlit", specifier = ">=1.40.0" },
+    { name = "streamlit", specifier = ">=1.66.0" },
 ]
 provides-extras = ["dev"]
 

@@ -4,6 +4,7 @@ import os
 import sqlite3
 import sys
 from contextlib import closing
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Final, cast
 
@@ -18,7 +19,14 @@ if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
 from backup_manager import get_backup_dir, run_backup, set_backup_dir
-from sync import DEFAULT_DB_PATH, SyncError, sync_spreadsheet_to_sqlite
+from sync import (
+    DEFAULT_DB_PATH,
+    SyncError,
+    build_csv_url,
+    fetch_csv_content,
+    parse_and_clean_csv,
+    persist_dataframe_to_sqlite,
+)
 
 # Load environment variables
 load_dotenv(_ROOT / ".env")
@@ -59,7 +67,6 @@ def load_available_exercises(db_path_str: str) -> list[str]:
     try:
         with closing(sqlite3.connect(db_path)) as conn:
             cursor = conn.cursor()
-            # Check if table exists
             cursor.execute(
                 "SELECT name FROM sqlite_master WHERE type='table' AND name='workout_logs';"
             )
@@ -103,13 +110,16 @@ def load_available_modes(db_path_str: str, exercise_name: str) -> list[str]:
 
 
 @st.cache_data(show_spinner=False)
-def load_exercise_logs(db_path_str: str, exercise_name: str, mode: str = "全件") -> pd.DataFrame:
-    """Fetch chronological workout logs for an exercise with optional mode filter.
+def load_exercise_logs(
+    db_path_str: str, exercise_name: str, mode: str = "全件", period: str = "全期間"
+) -> pd.DataFrame:
+    """Fetch chronological workout logs for an exercise with mode and period filters.
 
     Args:
         db_path_str: Path string to SQLite database.
         exercise_name: Target exercise name.
         mode: Target mode ('全件' for all modes).
+        period: Time period filter ('全期間', '直近90日', '直近30日').
 
     Returns:
         pd.DataFrame: Loaded records ordered chronologically.
@@ -129,6 +139,15 @@ def load_exercise_logs(db_path_str: str, exercise_name: str, mode: str = "全件
             if mode != "全件":
                 query += " AND mode = ?"
                 params.append(mode)
+
+            if period == "直近30日":
+                cutoff = (datetime.now() - timedelta(days=30)).strftime("%Y-%m-%d %H:%M:%S")
+                query += " AND timestamp >= ?"
+                params.append(cutoff)
+            elif period == "直近90日":
+                cutoff = (datetime.now() - timedelta(days=90)).strftime("%Y-%m-%d %H:%M:%S")
+                query += " AND timestamp >= ?"
+                params.append(cutoff)
 
             query += " ORDER BY timestamp ASC;"
             df = pd.read_sql_query(query, conn, params=params)
@@ -153,7 +172,7 @@ def is_aerobic_exercise(name: str) -> bool:
 
 
 def render_strength_chart(df: pd.DataFrame) -> alt.LayerChart:
-    """Build dual-axis Altair chart for resistance training (Load vs Volume).
+    """Build modern dual-axis Altair chart for resistance training (Load vs Volume).
 
     Args:
         df: Chronological dataframe for the selected exercise.
@@ -165,39 +184,44 @@ def render_strength_chart(df: pd.DataFrame) -> alt.LayerChart:
         x=alt.X(
             "timestamp:T",
             title="記録日時",
-            axis=alt.Axis(format="%Y-%m-%d %H:%M", labelAngle=-30),
+            axis=alt.Axis(format="%Y-%m-%d %H:%M", labelAngle=-30, grid=False),
         )
     )
 
-    # Volume bar chart (Right Y-axis)
-    bar = base.mark_bar(opacity=0.35, color="#4A90E2", size=18).encode(
+    # Volume bar chart (Right Y-axis, sleek modern indigo)
+    bar = base.mark_bar(opacity=0.3, color="#6366F1", size=16, cornerRadiusTop=4).encode(
         y=alt.Y(
             "calculated_volume:Q",
-            title="総ボリューム (負荷 × 回数)",
-            axis=alt.Axis(titleColor="#4A90E2"),
+            title="総ボリューム (負荷 × 回数) [kg]",
+            axis=alt.Axis(titleColor="#6366F1", grid=False),
         ),
         tooltip=[
             alt.Tooltip("timestamp:T", title="日時", format="%Y-%m-%d %H:%M"),
-            alt.Tooltip("load:Q", title="負荷 (kg)"),
-            alt.Tooltip("volume:Q", title="回数 (reps)"),
-            alt.Tooltip("calculated_volume:Q", title="ボリューム (kg)"),
+            alt.Tooltip("load:Q", title="負荷 (kg)", format=".1f"),
+            alt.Tooltip("volume:Q", title="回数 (reps)", format=".0f"),
+            alt.Tooltip("calculated_volume:Q", title="ボリューム (kg)", format=".1f"),
             alt.Tooltip("mode:N", title="モード"),
         ],
     )
 
-    # Load line chart with points (Left Y-axis)
-    line = base.mark_line(point=True, color="#E94E77", strokeWidth=2.5).encode(
+    # Load line chart with points (Left Y-axis, vibrant rose)
+    line = base.mark_line(
+        point=alt.OverlayMarkDef(filled=True, size=60, color="#F43F5E"),
+        color="#F43F5E",
+        strokeWidth=3,
+        interpolate="monotone",
+    ).encode(
         y=alt.Y(
             "load:Q",
             title="負荷重量 (kg)",
             scale=alt.Scale(zero=False),
-            axis=alt.Axis(titleColor="#E94E77"),
+            axis=alt.Axis(titleColor="#F43F5E"),
         ),
         tooltip=[
             alt.Tooltip("timestamp:T", title="日時", format="%Y-%m-%d %H:%M"),
-            alt.Tooltip("load:Q", title="負荷 (kg)"),
-            alt.Tooltip("volume:Q", title="回数 (reps)"),
-            alt.Tooltip("calculated_volume:Q", title="ボリューム (kg)"),
+            alt.Tooltip("load:Q", title="負荷 (kg)", format=".1f"),
+            alt.Tooltip("volume:Q", title="回数 (reps)", format=".0f"),
+            alt.Tooltip("calculated_volume:Q", title="ボリューム (kg)", format=".1f"),
             alt.Tooltip("mode:N", title="モード"),
         ],
     )
@@ -207,15 +231,19 @@ def render_strength_chart(df: pd.DataFrame) -> alt.LayerChart:
         .resolve_scale(y="independent")
         .properties(
             width="container",
-            height=420,
-            title="重量・ボリューム推移（筋力トレーニング）",
+            height=440,
+            title=alt.TitleParams(
+                text="重量・ボリューム推移（筋力トレーニング）",
+                fontSize=14,
+                color="#94A3B8",
+            ),
         )
     )
     return cast(alt.LayerChart, chart)
 
 
 def render_aerobic_chart(df: pd.DataFrame) -> alt.LayerChart:
-    """Build dual-axis Altair chart for aerobic exercises (Heart Rate vs Duration).
+    """Build modern dual-axis Altair chart for aerobic exercises (Heart Rate vs Duration).
 
     Args:
         df: Chronological dataframe for the selected exercise.
@@ -227,37 +255,42 @@ def render_aerobic_chart(df: pd.DataFrame) -> alt.LayerChart:
         x=alt.X(
             "timestamp:T",
             title="記録日時",
-            axis=alt.Axis(format="%Y-%m-%d %H:%M", labelAngle=-30),
+            axis=alt.Axis(format="%Y-%m-%d %H:%M", labelAngle=-30, grid=False),
         )
     )
 
-    # Duration bar chart (Right Y-axis)
-    bar = base.mark_bar(opacity=0.4, color="#50E3C2", size=18).encode(
+    # Duration bar chart (Right Y-axis, teal)
+    bar = base.mark_bar(opacity=0.35, color="#14B8A6", size=16, cornerRadiusTop=4).encode(
         y=alt.Y(
             "volume:Q",
             title="運動時間 (min)",
-            axis=alt.Axis(titleColor="#50E3C2"),
+            axis=alt.Axis(titleColor="#14B8A6", grid=False),
         ),
         tooltip=[
             alt.Tooltip("timestamp:T", title="日時", format="%Y-%m-%d %H:%M"),
-            alt.Tooltip("load:Q", title="目標/心拍数 (bpm)"),
-            alt.Tooltip("volume:Q", title="運動時間 (min)"),
+            alt.Tooltip("load:Q", title="心拍数 (bpm)", format=".0f"),
+            alt.Tooltip("volume:Q", title="運動時間 (min)", format=".1f"),
             alt.Tooltip("mode:N", title="モード"),
         ],
     )
 
-    # Heart rate line chart (Left Y-axis)
-    line = base.mark_line(point=True, color="#F5A623", strokeWidth=2.5).encode(
+    # Heart rate line chart (Left Y-axis, amber)
+    line = base.mark_line(
+        point=alt.OverlayMarkDef(filled=True, size=60, color="#F59E0B"),
+        color="#F59E0B",
+        strokeWidth=3,
+        interpolate="monotone",
+    ).encode(
         y=alt.Y(
             "load:Q",
             title="心拍数 (bpm)",
             scale=alt.Scale(zero=False),
-            axis=alt.Axis(titleColor="#F5A623"),
+            axis=alt.Axis(titleColor="#F59E0B"),
         ),
         tooltip=[
             alt.Tooltip("timestamp:T", title="日時", format="%Y-%m-%d %H:%M"),
-            alt.Tooltip("load:Q", title="心拍数 (bpm)"),
-            alt.Tooltip("volume:Q", title="運動時間 (min)"),
+            alt.Tooltip("load:Q", title="心拍数 (bpm)", format=".0f"),
+            alt.Tooltip("volume:Q", title="運動時間 (min)", format=".1f"),
             alt.Tooltip("mode:N", title="モード"),
         ],
     )
@@ -267,49 +300,120 @@ def render_aerobic_chart(df: pd.DataFrame) -> alt.LayerChart:
         .resolve_scale(y="independent")
         .properties(
             width="container",
-            height=420,
-            title="心拍数・運動時間推移（有酸素トレーニング）",
+            height=440,
+            title=alt.TitleParams(
+                text="心拍数・運動時間推移（有酸素トレーニング）",
+                fontSize=14,
+                color="#94A3B8",
+            ),
         )
     )
     return cast(alt.LayerChart, chart)
 
 
+@st.dialog("スプレッドシートデータ全量同期の確認")
+def confirm_sync_dialog(sheet_id: str) -> None:
+    """Show modal confirmation dialog for full-refresh spreadsheet sync.
+
+    Args:
+        sheet_id: Target Google Spreadsheet ID to sync from.
+    """
+    st.write("スプレッドシートから最新データを取得し、ローカルデータベースを全量洗い替えます。")
+    st.caption("※ 障害時・通信エラー時は既存データが自動保護されます。")
+
+    if st.button("全量同期を実行する", type="primary", use_container_width=True):
+        with st.status("スプレッドシートと同期中...", expanded=True) as status:
+            try:
+                st.write("📡 スプレッドシートからCSVデータを取得中...")
+                url = build_csv_url(sheet_id)
+                csv_text = fetch_csv_content(url)
+
+                st.write("🧹 データ型変換・バリデーション検証中...")
+                cleaned_df = parse_and_clean_csv(csv_text)
+
+                st.write("💾 SQLiteデータベースへアトミック全量更新中...")
+                count = persist_dataframe_to_sqlite(cleaned_df, db_path=DEFAULT_DB_PATH)
+
+                status.update(
+                    label="同期完了！最新データを反映しました。",
+                    state="complete",
+                    expanded=False,
+                )
+                st.cache_data.clear()
+                st.toast(f"✅ 正常に {count} 件のログを同期しました！", icon="🏋️")
+                st.rerun()
+            except SyncError as e:
+                status.update(label="同期失敗", state="error", expanded=True)
+                st.error(f"同期エラー: {e!s}")
+
+
+@st.fragment
+def render_sync_section() -> None:
+    """Render isolated reactive sync form widget inside sidebar."""
+    st.header("⚙️ データ同期設定")
+    with st.form("sync_form", clear_on_submit=False):
+        sheet_id_input = st.text_input(
+            "スプレッドシートID",
+            value=DEFAULT_SPREADSHEET_ID,
+            help="GoogleスプレッドシートのURLに含まれるID（共有設定：リンクを知っている全員が閲覧可）。",
+        )
+        submit_sync = st.form_submit_button("今すぐスプシから最新データを同期", type="primary")
+
+    if submit_sync:
+        clean_id = sheet_id_input.strip()
+        if not clean_id:
+            st.error("スプレッドシートIDを入力してください。")
+        else:
+            confirm_sync_dialog(clean_id)
+
+
+@st.fragment
+def render_backup_section() -> None:
+    """Render isolated reactive data protection and backup widget inside sidebar."""
+    st.divider()
+    st.subheader("データ保護・バックアップ")
+
+    current_dir = str(get_backup_dir())
+    new_dir = st.text_input("保存先フォルダ", value=current_dir)
+    if new_dir != current_dir and st.button("保存先パスを更新", use_container_width=True):
+        save_res = set_backup_dir(new_dir)
+        if save_res["success"]:
+            st.success(str(save_res["message"]))
+            st.toast("バックアップ保存先を更新しました", icon="📁")
+            st.rerun()
+        else:
+            st.error(str(save_res["message"]))
+
+    if st.button("今すぐバックアップを実行", use_container_width=True):
+        with st.spinner("圧縮・整合性検証中..."):
+            backup_res = run_backup(app_name="choco_fitness", source_dir="./data")
+        if backup_res["success"]:
+            st.success(str(backup_res["message"]))
+            st.caption(f"完了日時: {backup_res['timestamp']}")
+            st.caption(f"保存先: {backup_res['destination']}")
+            st.toast("バックアップが完了しました！", icon="💾")
+        else:
+            st.error(str(backup_res["message"]))
+
+
 def main() -> None:
     """Render the main Streamlit application layout and reactive state."""
-    st.set_page_config(page_title="ChocoLog Fitness", page_icon="🏋️", layout="wide")
+    st.set_page_config(
+        page_title="ChocoLog Fitness",
+        page_icon="🏋️",
+        layout="wide",
+        initial_sidebar_state="expanded",
+    )
 
-    # Header section
-    st.title("🏋️ ChocoLog 運動ログ可視化ダッシュボード")
+    # Top Brand Header
+    st.title("🏋️ ChocoLog 運動ログ分析ダッシュボード")
     st.caption("Googleスプレッドシート連携型 筋力・有酸素トレーニング推移分析ツール")
 
     db_path_str = str(DEFAULT_DB_PATH)
 
-    # Sidebar: Synchronization, filtering, and data protection
+    # Sidebar: Isolated Fragments
     with st.sidebar:
-        st.header("⚙️ データ同期設定")
-        with st.form("sync_form", clear_on_submit=False):
-            sheet_id_input = st.text_input(
-                "スプレッドシートID",
-                value=DEFAULT_SPREADSHEET_ID,
-                help="GoogleスプレッドシートのURLに含まれるIDを入力してください（共有設定：リンクを知っている全員が閲覧可）。",
-            )
-            submit_sync = st.form_submit_button("今すぐスプシから最新データを同期", type="primary")
-
-        if submit_sync:
-            if not sheet_id_input.strip():
-                st.error("スプレッドシートIDが入力されていません。")
-            else:
-                with st.spinner("スプレッドシートからデータを取得・更新中..."):
-                    try:
-                        res = sync_spreadsheet_to_sqlite(
-                            spreadsheet_id=sheet_id_input.strip(),
-                            db_path=DEFAULT_DB_PATH,
-                        )
-                        st.success(str(res["message"]))
-                        st.cache_data.clear()
-                        st.rerun()
-                    except SyncError as e:
-                        st.error(f"同期失敗: {e!s}")
+        render_sync_section()
 
         st.divider()
         st.header("🔍 表示フィルタ")
@@ -317,58 +421,62 @@ def main() -> None:
         available_exercises = load_available_exercises(db_path_str)
         selected_exercise: str | None = None
         selected_mode: str = "全件"
+        selected_period: str = "全期間"
 
         if available_exercises:
             selected_exercise = st.selectbox(
                 "種目を選択",
                 options=available_exercises,
                 index=0,
-                help="可視化対象のトレーニング種目を選択してください。",
+                help="分析・可視化対象のトレーニング種目を選択してください。",
             )
 
             if selected_exercise:
                 available_modes = load_available_modes(db_path_str, selected_exercise)
                 if len(available_modes) > 1:
-                    selected_mode = st.selectbox("モードを選択", options=available_modes, index=0)
+                    st.caption("トレーニングモード")
+                    mode_val = st.pills(
+                        "モード",
+                        options=available_modes,
+                        default=available_modes[0],
+                        label_visibility="collapsed",
+                    )
+                    selected_mode = mode_val or available_modes[0]
                 else:
                     selected_mode = "全件"
+
+                st.caption("表示期間")
+                period_val = st.segmented_control(
+                    "期間",
+                    options=["全期間", "直近90日", "直近30日"],
+                    default="全期間",
+                    label_visibility="collapsed",
+                )
+                selected_period = period_val or "全期間"
         else:
             st.info("データがありません。上の同期ボタンを押してデータを読み込んでください。")
 
-        # Standardized Data Backup Section (Python-backup-script compliant)
-        st.divider()
-        st.subheader("データ保護・バックアップ")
+        render_backup_section()
 
-        current_dir = str(get_backup_dir())
-        new_dir = st.text_input("保存先フォルダ", value=current_dir)
-        if new_dir != current_dir and st.button("保存先パスを更新", use_container_width=True):
-            save_res = set_backup_dir(new_dir)
-            if save_res["success"]:
-                st.success(str(save_res["message"]))
-                st.rerun()
-            else:
-                st.error(str(save_res["message"]))
-
-        if st.button("今すぐバックアップを実行", use_container_width=True):
-            with st.spinner("圧縮・整合性検証中..."):
-                backup_res = run_backup(app_name="choco_fitness", source_dir="./data")
-            if backup_res["success"]:
-                st.success(str(backup_res["message"]))
-                st.caption(f"完了日時: {backup_res['timestamp']}")
-                st.caption(f"保存先: {backup_res['destination']}")
-            else:
-                st.error(str(backup_res["message"]))
-
-    # Main Workspace: Metrics, Visualization, and History Table
     if not selected_exercise:
         st.info(
             "サイドバーの「今すぐスプシから最新データを同期」を実行し、分析対象の種目を選択してください。"
         )
         return
 
-    df = load_exercise_logs(db_path_str, selected_exercise, mode=selected_mode)
+    df = load_exercise_logs(
+        db_path_str,
+        selected_exercise,
+        mode=selected_mode,
+        period=selected_period,
+    )
+
     if df.empty:
-        st.warning(f"「{selected_exercise}」({selected_mode}) のデータは見つかりませんでした。")
+        warn_msg = (
+            f"「{selected_exercise}」({selected_mode} / {selected_period}) "
+            "のデータは見つかりませんでした。"
+        )
+        st.warning(warn_msg)
         return
 
     is_aerobic = is_aerobic_exercise(selected_exercise)
@@ -389,9 +497,10 @@ def main() -> None:
 
     with col2:
         latest_load = latest_record["load"]
+        prev_load = prev_record["load"] if prev_record is not None else None
         load_delta = (
-            f"{latest_load - prev_record['load']:+.1f} {load_unit}"
-            if (prev_record is not None and pd.notna(latest_load) and pd.notna(prev_record["load"]))
+            f"{latest_load - prev_load:+.1f} {load_unit}"
+            if (prev_load is not None and pd.notna(latest_load) and pd.notna(prev_load))
             else None
         )
         st.metric(
@@ -417,13 +526,10 @@ def main() -> None:
     with col4:
         if not is_aerobic:
             latest_calc = latest_record["calculated_volume"]
+            prev_calc = prev_record["calculated_volume"] if prev_record is not None else None
             calc_delta = (
-                f"{latest_calc - prev_record['calculated_volume']:+.1f} kg"
-                if (
-                    prev_record is not None
-                    and pd.notna(latest_calc)
-                    and pd.notna(prev_record["calculated_volume"])
-                )
+                f"{latest_calc - prev_calc:+.1f} kg"
+                if (prev_calc is not None and pd.notna(latest_calc) and pd.notna(prev_calc))
                 else None
             )
             st.metric(
@@ -436,32 +542,79 @@ def main() -> None:
 
     st.divider()
 
-    # 2. Charts Section
-    st.subheader("📈 経過推移チャート")
-    chart = render_aerobic_chart(df) if is_aerobic else render_strength_chart(df)
-    st.altair_chart(chart, use_container_width=True)
+    # 2. Modern Tabbed Workspace Layout
+    tab_chart, tab_table, tab_stats = st.tabs(
+        ["📈 経過推移チャート", "📋 過去ログ履歴一覧", "🏆 個人ベスト & 統計"]
+    )
 
-    st.divider()
+    with tab_chart:
+        chart = render_aerobic_chart(df) if is_aerobic else render_strength_chart(df)
+        st.altair_chart(chart, use_container_width=True)
 
-    # 3. History Data Table Section
-    st.subheader("📋 過去ログ履歴一覧")
-    display_df = df.sort_values(by="timestamp", ascending=False).copy()
-    display_df["timestamp"] = display_df["timestamp"].dt.strftime("%Y-%m-%d %H:%M")
+    with tab_table:
+        display_df = df.sort_values(by="timestamp", ascending=False).copy()
 
-    rename_map = {
-        "timestamp": "記録日時",
-        "name": "種目名",
-        "load": f"負荷 ({load_unit})",
-        "volume": f"量 ({volume_unit})",
-        "mode": "モード",
-        "calculated_volume": "総ボリューム (kg)",
-    }
-    display_df = display_df.rename(columns=rename_map)
+        column_configs = {
+            "timestamp": st.column_config.DatetimeColumn(
+                "記録日時", format="YYYY-MM-DD HH:mm", width="medium"
+            ),
+            "name": st.column_config.TextColumn("種目名", width="medium"),
+            "load": st.column_config.NumberColumn(
+                f"負荷 ({load_unit})", format=f"%.1f {load_unit}"
+            ),
+            "volume": st.column_config.NumberColumn(
+                f"量 ({volume_unit})", format=f"%.0f {volume_unit}"
+            ),
+            "mode": st.column_config.TextColumn("モード", width="small"),
+            "calculated_volume": st.column_config.NumberColumn(
+                "総ボリューム (kg)", format="%.1f kg"
+            ),
+        }
 
-    if is_aerobic:
-        display_df = display_df.drop(columns=["総ボリューム (kg)"], errors="ignore")
+        if is_aerobic:
+            display_df = display_df.drop(columns=["calculated_volume"], errors="ignore")
+            column_configs.pop("calculated_volume", None)
 
-    st.dataframe(display_df, use_container_width=True, hide_index=True)
+        st.dataframe(
+            display_df,
+            column_config=column_configs,
+            use_container_width=True,
+            hide_index=True,
+        )
+
+    with tab_stats:
+        s_col1, s_col2, s_col3, s_col4 = st.columns(4)
+        with s_col1:
+            st.metric("総セッション数", f"{len(df)} 回")
+
+        max_load = df["load"].max()
+        with s_col2:
+            st.metric(
+                f"最高記録 ({load_unit})",
+                f"{max_load:.1f} {load_unit}" if pd.notna(max_load) else "-",
+            )
+
+        with s_col3:
+            if not is_aerobic:
+                max_vol = df["calculated_volume"].max()
+                st.metric(
+                    "最高ボリューム",
+                    f"{max_vol:.1f} kg" if pd.notna(max_vol) else "-",
+                )
+            else:
+                max_duration = df["volume"].max()
+                st.metric(
+                    "最長運動時間",
+                    f"{max_duration:.0f} min" if pd.notna(max_duration) else "-",
+                )
+
+        with s_col4:
+            first_load = df.iloc[0]["load"]
+            if pd.notna(first_load) and pd.notna(latest_load) and first_load > 0:
+                growth_rate = ((latest_load - first_load) / first_load) * 100
+                st.metric("初回比 成長率", f"{growth_rate:+.1f} %")
+            else:
+                st.metric("初回比 成長率", "-")
 
 
 if __name__ == "__main__":
