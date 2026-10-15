@@ -189,7 +189,13 @@ def render_strength_chart(df: pd.DataFrame) -> alt.LayerChart:
     )
 
     # Volume bar chart (Right Y-axis, sleek modern indigo)
-    bar = base.mark_bar(opacity=0.3, color="#6366F1", size=16, cornerRadiusTop=4).encode(
+    bar = base.mark_bar(
+        opacity=0.3,
+        color="#6366F1",
+        size=16,
+        cornerRadiusTopLeft=4,
+        cornerRadiusTopRight=4,
+    ).encode(
         y=alt.Y(
             "calculated_volume:Q",
             title="総ボリューム (負荷 × 回数) [kg]",
@@ -260,7 +266,13 @@ def render_aerobic_chart(df: pd.DataFrame) -> alt.LayerChart:
     )
 
     # Duration bar chart (Right Y-axis, teal)
-    bar = base.mark_bar(opacity=0.35, color="#14B8A6", size=16, cornerRadiusTop=4).encode(
+    bar = base.mark_bar(
+        opacity=0.35,
+        color="#14B8A6",
+        size=16,
+        cornerRadiusTopLeft=4,
+        cornerRadiusTopRight=4,
+    ).encode(
         y=alt.Y(
             "volume:Q",
             title="運動時間 (min)",
