@@ -398,7 +398,7 @@ def render_backup_section() -> None:
 
     if st.button("今すぐバックアップを実行", use_container_width=True):
         with st.spinner("圧縮・整合性検証中..."):
-            backup_res = run_backup(app_name="choco_fitness", source_dir="./data")
+            backup_res = run_backup(app_name="choco_fitness", source_dir=str(_ROOT / "data"))
         if backup_res["success"]:
             st.success(str(backup_res["message"]))
             st.caption(f"完了日時: {backup_res['timestamp']}")

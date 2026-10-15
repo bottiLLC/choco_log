@@ -51,3 +51,36 @@ def test_set_and_get_backup_dir(temp_data_dir: Path, monkeypatch: pytest.MonkeyP
 
     resolved = get_backup_dir()
     assert resolved == target_dir.resolve()
+
+
+def test_set_backup_dir_config_permission_error(
+    temp_data_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Verify informative error message when _CONFIG_FILE cannot be written."""
+    config_file = temp_data_dir / "backup_config.json"
+    monkeypatch.setattr("backup_manager._CONFIG_FILE", config_file)
+
+    def mock_open(*_args: object, **_kwargs: object) -> None:
+        raise PermissionError(13, "Permission denied")
+
+    monkeypatch.setattr("builtins.open", mock_open)
+    target_dir = temp_data_dir / "custom_dest"
+    res = set_backup_dir(str(target_dir))
+    assert res["success"] is False
+    assert "内部設定ファイル" in str(res["message"])
+    assert "権限がありません" in str(res["message"])
+
+
+def test_set_backup_dir_target_unwritable(
+    temp_data_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Verify clear error message when target backup folder is unwritable."""
+
+    def mock_touch(_self: Path, *_args: object, **_kwargs: object) -> None:
+        raise PermissionError(13, "Permission denied")
+
+    monkeypatch.setattr(Path, "touch", mock_touch)
+    target_dir = temp_data_dir / "custom_dest"
+    res = set_backup_dir(str(target_dir))
+    assert res["success"] is False
+    assert "保存先フォルダへの書き込み権限がありません" in str(res["message"])

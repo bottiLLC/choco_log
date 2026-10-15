@@ -8,8 +8,10 @@ import zipfile
 from datetime import UTC, datetime
 from pathlib import Path
 
-_CONFIG_FILE = Path("./data/backup_config.json")
-_DEFAULT_BACKUP_DIR = Path("./backups")
+_ROOT = Path(__file__).resolve().parent
+_DATA_DIR = _ROOT / "data"
+_CONFIG_FILE = _DATA_DIR / "backup_config.json"
+_DEFAULT_BACKUP_DIR = _ROOT / "backups"
 
 
 def get_backup_dir() -> Path:
@@ -45,28 +47,59 @@ def set_backup_dir(target_dir: str) -> dict[str, str | bool]:
         dict[str, str | bool]: Operation status and receipt message.
     """
     path = Path(target_dir).resolve()
+    # 1. Validate target destination directory
     try:
         path.mkdir(parents=True, exist_ok=True)
+        probe_file = path / ".write_probe.tmp"
+        try:
+            probe_file.touch(exist_ok=True)
+            probe_file.unlink(missing_ok=True)
+        except OSError as e:
+            return {
+                "success": False,
+                "message": f"保存先フォルダへの書き込み権限がありません: {e!s}",
+            }
+    except OSError as e:
+        return {
+            "success": False,
+            "message": f"保存先フォルダを作成できません: {e!s}",
+        }
+
+    # 2. Persist configuration to internal config file
+    try:
         _CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
         with open(_CONFIG_FILE, "w", encoding="utf-8") as f:
             json.dump({"backup_dir": str(path)}, f, indent=2)
         return {"success": True, "message": f"バックアップ先を設定しました: {path!s}"}
+    except PermissionError as e:
+        return {
+            "success": False,
+            "message": (
+                f"内部設定ファイル ({_CONFIG_FILE}) への書き込み権限がありません。"
+                f"フォルダ権限を確認するか管理者権限で実行してください: {e!s}"
+            ),
+        }
     except OSError as e:
-        err_msg = f"保存先パスが無効、または書き込み権限がありません: {e!s}"
-        return {"success": False, "message": err_msg}
+        return {
+            "success": False,
+            "message": f"設定ファイルの書き込みに失敗しました: {e!s}",
+        }
 
 
-def run_backup(app_name: str = "app", source_dir: str = "./data") -> dict[str, str | bool]:
+def run_backup(
+    app_name: str = "app",
+    source_dir: str | Path | None = None,
+) -> dict[str, str | bool]:
     """Execute verified atomic ZIP backup of persistent data directory.
 
     Args:
         app_name: Name prefix for generated backup archive.
-        source_dir: Source directory containing persistent files.
+        source_dir: Source directory containing persistent files. Defaults to project ./data.
 
     Returns:
         dict[str, str | bool]: Verification metadata and receipt.
     """
-    source_path = Path(source_dir).resolve()
+    source_path = Path(source_dir).resolve() if source_dir is not None else _DATA_DIR.resolve()
 
     # 1. Interlock: Source presence
     if not source_path.exists() or not any(source_path.iterdir()):
