@@ -47,7 +47,7 @@ function getInitialData() {
       selectedMode: prev ? prev.mode : (modes[0] || ''),
       load: prev ? Number(prev.load) : defaultLoad,
       volume: prev ? Number(prev.volume) : defaultVol,
-      active: true // 実施するかどうかのフラグ
+      active: false // 実施するかどうかのフラグ（初期値はパス）
     };
   });
 
