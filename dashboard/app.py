@@ -22,6 +22,8 @@ from backup_manager import get_backup_dir, run_backup, set_backup_dir
 from sync import (
     DEFAULT_DB_PATH,
     SyncError,
+    SyncInterlockError,
+    SyncStats,
     build_csv_url,
     fetch_csv_content,
     parse_and_clean_csv,
@@ -449,19 +451,29 @@ def render_aerobic_chart(
     return cast(alt.LayerChart, chart)
 
 
-@st.dialog("スプレッドシートデータ全量同期の確認")
+@st.dialog("スプレッドシートデータ同期の確認")
 def confirm_sync_dialog(sheet_id: str) -> None:
-    """Show modal confirmation dialog for full-refresh spreadsheet sync.
+    """Show modal confirmation dialog for incremental spreadsheet sync with safety controls.
 
     Args:
         sheet_id: Target Google Spreadsheet ID to sync from.
     """
-    st.write("スプレッドシートから最新データを取得し、ローカルデータベースを全量洗い替えます。")
-    st.caption("※ 障害時・通信エラー時は既存データが自動保護されます。")
+    st.write("スプレッドシートから最新データを取得し、差分更新（UPSERT）を実行します。")
+    st.caption("※ 取得件数が激減した場合は安全装置が作動し、既存データは自動保護されます。")
 
-    if st.button("全量同期を実行する", type="primary", use_container_width=True):
+    force_full = st.checkbox(
+        "⚠️ 強制全量同期（激減保護を無効化して完全洗い替え）",
+        value=False,
+        help="スプレッドシート側で意図的に過去データを大幅削除した場合にのみチェックを入れてください。",
+    )
+
+    btn_label = "強制全量同期を実行する" if force_full else "差分同期を実行する"
+    if st.button(btn_label, type="primary", use_container_width=True):
         with st.status("スプレッドシートと同期中...", expanded=True) as status:
             try:
+                st.write("💾 事前スナップショットバックアップを作成中...")
+                run_backup(app_name="choco_presync", source_dir=DEFAULT_DB_PATH.parent)
+
                 st.write("📡 スプレッドシートからCSVデータを取得中...")
                 url = build_csv_url(sheet_id)
                 csv_text = fetch_csv_content(url)
@@ -469,8 +481,12 @@ def confirm_sync_dialog(sheet_id: str) -> None:
                 st.write("🧹 データ型変換・バリデーション検証中...")
                 cleaned_df = parse_and_clean_csv(csv_text)
 
-                st.write("💾 SQLiteデータベースへアトミック全量更新中...")
-                count = persist_dataframe_to_sqlite(cleaned_df, db_path=DEFAULT_DB_PATH)
+                st.write("💾 SQLiteデータベースへ差分UPSERT更新中...")
+                stats: SyncStats = persist_dataframe_to_sqlite(
+                    cleaned_df,
+                    db_path=DEFAULT_DB_PATH,
+                    force_full_refresh=force_full,
+                )
 
                 status.update(
                     label="同期完了！最新データを反映しました。",
@@ -478,8 +494,20 @@ def confirm_sync_dialog(sheet_id: str) -> None:
                     expanded=False,
                 )
                 st.cache_data.clear()
-                st.toast(f"✅ 正常に {count} 件のログを同期しました！", icon="🏋️")
+                receipt_msg = (
+                    f"✅ 正常に同期しました！ (新規: {stats.inserted}件 / "
+                    f"更新: {stats.updated}件 / 維持: {stats.unchanged}件 / 計: {stats.total_db}件)"
+                )
+                st.toast(receipt_msg, icon="🏋️")
                 st.rerun()
+            except SyncInterlockError as e:
+                status.update(label="安全装置作動（同期中断）", state="error", expanded=True)
+                st.error(f"🚨 {e!s}")
+                msg_hint = (
+                    "意図したデータ削除の場合は、上の"
+                    "「⚠️ 強制全量同期」にチェックを入れて再実行してください。"
+                )
+                st.warning(msg_hint)
             except SyncError as e:
                 status.update(label="同期失敗", state="error", expanded=True)
                 st.error(f"同期エラー: {e!s}")

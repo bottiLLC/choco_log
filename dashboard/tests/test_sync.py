@@ -11,8 +11,11 @@ import pytest
 
 from sync import (
     SyncError,
+    SyncInterlockError,
+    SyncStats,
     build_csv_url,
     fetch_csv_content,
+    generate_record_id,
     parse_and_clean_csv,
     persist_dataframe_to_sqlite,
     sync_spreadsheet_to_sqlite,
@@ -28,11 +31,22 @@ def test_build_csv_url() -> None:
     assert url == expected
 
 
+def test_generate_record_id() -> None:
+    """Verify deterministic SHA-256 derivation for record identifiers."""
+    id1 = generate_record_id("2026-03-29 10:00:00", "チェストプレス")
+    id2 = generate_record_id(" 2026-03-29 10:00:00 ", "チェストプレス ")
+    id3 = generate_record_id("2026-03-29 10:00:00", "レッグプレス")
+    assert id1 == id2
+    assert len(id1) == 16
+    assert id1 != id3
+
+
 def test_parse_and_clean_csv_success(mock_csv_content: str) -> None:
-    """Verify standard CSV parsing and calculated volume calculation."""
+    """Verify standard CSV parsing, calculated volume calculation, and record_id derivation."""
     df = parse_and_clean_csv(mock_csv_content)
     assert len(df) == 4
     assert list(df.columns) == [
+        "record_id",
         "timestamp",
         "name",
         "load",
@@ -43,6 +57,7 @@ def test_parse_and_clean_csv_success(mock_csv_content: str) -> None:
     # Check chest press calculated volume (40 * 10 = 400.0)
     assert df.iloc[0]["calculated_volume"] == 400.0
     assert df.iloc[2]["mode"] == ""
+    assert len(df.iloc[0]["record_id"]) == 16
 
 
 def test_parse_and_clean_csv_missing_columns() -> None:
@@ -70,8 +85,12 @@ def test_persist_dataframe_to_sqlite(temp_data_dir: Path, mock_csv_content: str)
     db_file = temp_data_dir / "test_fitness.db"
     df = parse_and_clean_csv(mock_csv_content)
 
-    count = persist_dataframe_to_sqlite(df, db_path=db_file)
-    assert count == 4
+    stats = persist_dataframe_to_sqlite(df, db_path=db_file)
+    assert stats.inserted == 4
+    assert stats.updated == 0
+    assert stats.unchanged == 0
+    assert stats.total_db == 4
+    assert int(stats) == 4
     assert db_file.exists()
 
     with closing(sqlite3.connect(db_file)) as conn:
@@ -86,6 +105,124 @@ def test_persist_dataframe_to_sqlite(temp_data_dir: Path, mock_csv_content: str)
         )
         cursor.execute(query)
         assert cursor.fetchone() is not None
+
+
+def test_persist_dataframe_to_sqlite_incremental_upsert(
+    temp_data_dir: Path, mock_csv_content: str
+) -> None:
+    """Verify UPSERT behaviour: insert new records and update existing ones without full wipe."""
+    db_file = temp_data_dir / "test_upsert.db"
+    initial_df = parse_and_clean_csv(mock_csv_content)
+    stats1 = persist_dataframe_to_sqlite(initial_df, db_path=db_file)
+    assert stats1.inserted == 4
+    assert stats1.total_db == 4
+
+    # Second pass: Modify 1 record, keep 3 unchanged, and add 1 new record
+    updated_csv = mock_csv_content + "\n2026-03-30 12:00:00,アブベンチ,0,25,"
+    # Alter the load of first row (40.0 -> 50.0)
+    updated_csv = updated_csv.replace(
+        "2026-03-01 10:00:00,チェストプレス,40,10,両手",
+        "2026-03-01 10:00:00,チェストプレス,50,10,両手",
+    )
+    second_df = parse_and_clean_csv(updated_csv)
+    assert len(second_df) == 5
+
+    stats2 = persist_dataframe_to_sqlite(second_df, db_path=db_file)
+    assert stats2.inserted == 1
+    assert stats2.updated == 1
+    assert stats2.unchanged == 3
+    assert stats2.total_db == 5
+
+    # Verify updated value in database
+    with closing(sqlite3.connect(db_file)) as conn:
+        cursor = conn.cursor()
+        query = (
+            "SELECT load, calculated_volume FROM workout_logs "
+            "WHERE name='チェストプレス' AND timestamp='2026-03-01 10:00:00';"
+        )
+        cursor.execute(query)
+        row = cursor.fetchone()
+        assert row[0] == 50.0
+        assert row[1] == 500.0
+
+
+def test_persist_dataframe_to_sqlite_interlock_and_force(temp_data_dir: Path) -> None:
+    """Verify SyncInterlockError on sudden drop, and bypass when force_full_refresh is enabled."""
+    db_file = temp_data_dir / "test_interlock.db"
+
+    # Pre-populate with 25 records (2 days to stay within valid hours)
+    csv_rows = ["timestamp,name,load,volume,mode"]
+    for i in range(25):
+        day = (i // 20) + 1
+        hour = i % 20
+        csv_rows.append(f"2026-01-{day:02d} {hour:02d}:00:00,種目_{i},10,10,通常")
+    large_csv = "\n".join(csv_rows)
+
+    large_df = parse_and_clean_csv(large_csv)
+    stats = persist_dataframe_to_sqlite(large_df, db_path=db_file)
+    assert stats.total_db == 25
+
+    # Prepare truncated dataset with only 5 records (< 50% of 25)
+    small_csv = "\n".join(csv_rows[:6])  # header + 5 rows
+    small_df = parse_and_clean_csv(small_csv)
+    assert len(small_df) == 5
+
+    # 1. Normal sync must raise SyncInterlockError and keep 25 records
+    with pytest.raises(SyncInterlockError, match="安全装置（激減インターロック）が作動しました"):
+        persist_dataframe_to_sqlite(small_df, db_path=db_file)
+
+    with closing(sqlite3.connect(db_file)) as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT COUNT(*) FROM workout_logs;")
+        assert cursor.fetchone()[0] == 25
+
+    # 2. Force full refresh bypasses interlock and replaces records
+    stats_forced = persist_dataframe_to_sqlite(small_df, db_path=db_file, force_full_refresh=True)
+    assert stats_forced.inserted == 5
+    assert stats_forced.total_db == 5
+
+    with closing(sqlite3.connect(db_file)) as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT COUNT(*) FROM workout_logs;")
+        assert cursor.fetchone()[0] == 5
+
+
+def test_schema_migration_from_legacy_table(temp_data_dir: Path, mock_csv_content: str) -> None:
+    """Verify seamless migration of legacy workout_logs schema without record_id."""
+    db_file = temp_data_dir / "legacy_fitness.db"
+
+    # Create legacy table without record_id
+    with closing(sqlite3.connect(db_file)) as conn:
+        cursor = conn.cursor()
+        cursor.execute("""
+            CREATE TABLE workout_logs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp TEXT NOT NULL,
+                name TEXT NOT NULL,
+                load REAL,
+                volume REAL,
+                mode TEXT,
+                calculated_volume REAL
+            );
+        """)
+        cursor.execute("""
+            INSERT INTO workout_logs (timestamp, name, load, volume, mode, calculated_volume)
+            VALUES ('2026-03-01 10:00:00', 'チェストプレス', 40.0, 10.0, '通常', 400.0);
+        """)
+        conn.commit()
+
+    df = parse_and_clean_csv(mock_csv_content)
+    stats = persist_dataframe_to_sqlite(df, db_path=db_file)
+    # 1 existing record updated/unchanged, other 3 inserted
+    assert stats.total_db == 4
+
+    # Verify migrated table structure
+    with closing(sqlite3.connect(db_file)) as conn:
+        cursor = conn.cursor()
+        cursor.execute("PRAGMA table_info(workout_logs);")
+        columns = [row[1] for row in cursor.fetchall()]
+        assert "record_id" in columns
+        assert "updated_at" in columns
 
 
 def test_fetch_csv_content_detects_google_login() -> None:
@@ -107,6 +244,40 @@ def test_sync_spreadsheet_to_sqlite_missing_id(monkeypatch: pytest.MonkeyPatch) 
     monkeypatch.delenv("SPREADSHEET_ID", raising=False)
     with pytest.raises(SyncError, match="スプレッドシートIDが指定されていません"):
         sync_spreadsheet_to_sqlite(spreadsheet_id=None)
+
+
+def test_sync_spreadsheet_to_sqlite_end_to_end(temp_data_dir: Path, mock_csv_content: str) -> None:
+    """Verify full orchestration of sync_spreadsheet_to_sqlite with pre-sync backup."""
+    db_file = temp_data_dir / "e2e.db"
+    mock_resp = MagicMock()
+    mock_resp.read.return_value = mock_csv_content.encode("utf-8")
+    mock_resp.__enter__.return_value = mock_resp
+
+    with (
+        patch("urllib.request.urlopen", return_value=mock_resp),
+        patch("backup_manager.run_backup", return_value={"success": True}) as mock_backup,
+    ):
+        # 1st run: no db exists yet, auto_backup not triggered on non-existent db
+        res1 = sync_spreadsheet_to_sqlite(
+            spreadsheet_id="test_sheet",
+            db_path=db_file,
+            auto_backup=True,
+        )
+        assert res1["success"] is True
+        assert res1["count"] == 4
+        stats1 = res1["stats"]
+        assert isinstance(stats1, SyncStats)
+        assert stats1.inserted == 4
+
+        # 2nd run: db exists, auto_backup is triggered
+        res2 = sync_spreadsheet_to_sqlite(
+            spreadsheet_id="test_sheet",
+            db_path=db_file,
+            auto_backup=True,
+        )
+        assert res2["success"] is True
+        assert mock_backup.called
+        assert "事前バックアップ作成済" in str(res2["message"])
 
 
 def test_persist_dataframe_to_sqlite_permission_error_existing(
@@ -179,7 +350,21 @@ def test_persist_dataframe_to_sqlite_clears_readonly_attribute(
 
     try:
         df = parse_and_clean_csv(mock_csv_content)
-        count = persist_dataframe_to_sqlite(df, db_path=db_file)
-        assert count == 4
+        stats = persist_dataframe_to_sqlite(df, db_path=db_file)
+        assert stats.total_db == 4
     finally:
         os.chmod(db_file, stat.S_IWRITE)
+
+
+def test_persist_dataframe_to_sqlite_mkdir_oserror(
+    temp_data_dir: Path, mock_csv_content: str
+) -> None:
+    """Verify SyncError when directory creation fails with OSError."""
+    db_file = temp_data_dir / "unreachable" / "fail.db"
+    df = parse_and_clean_csv(mock_csv_content)
+
+    with (
+        patch.object(Path, "mkdir", side_effect=OSError("Disk failure")),
+        pytest.raises(SyncError, match="データベース配置ディレクトリの作成に失敗しました"),
+    ):
+        persist_dataframe_to_sqlite(df, db_path=db_file)
