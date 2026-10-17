@@ -6,7 +6,7 @@ import sys
 from contextlib import closing
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Final, cast
+from typing import Any, Final, cast
 
 import altair as alt
 import pandas as pd
@@ -171,75 +171,183 @@ def is_aerobic_exercise(name: str) -> bool:
     return any(keyword in lower for keyword in AEROBIC_KEYWORDS)
 
 
-def render_strength_chart(df: pd.DataFrame) -> alt.LayerChart:
-    """Build modern dual-axis Altair chart for resistance training (Load vs Volume).
+def aggregate_daily_logs(df: pd.DataFrame, is_aerobic: bool = False) -> pd.DataFrame:
+    """Aggregate per-set workout logs into deterministic daily summaries.
 
     Args:
-        df: Chronological dataframe for the selected exercise.
+        df: Raw workout records containing timestamp, load, volume, and mode.
+        is_aerobic: True for cardiovascular exercises, False for resistance training.
 
     Returns:
-        alt.LayerChart: Layered chart resolving independent Y axes.
+        pd.DataFrame: Daily aggregated records with summed volume and peak load metrics.
     """
-    base = alt.Chart(df).encode(
+    if df.empty:
+        return pd.DataFrame(
+            columns=[
+                "date_str",
+                "timestamp",
+                "name",
+                "load",
+                "volume",
+                "mode",
+                "calculated_volume",
+                "set_count",
+            ]
+        )
+
+    work_df = df.copy()
+    work_df["date_str"] = pd.to_datetime(work_df["timestamp"]).dt.strftime("%Y-%m-%d")
+
+    records: list[dict[str, Any]] = []
+    for date_str, group in work_df.groupby("date_str", sort=True):
+        total_vol = float(group["volume"].sum())
+        max_load = float(group["load"].max()) if group["load"].notna().any() else 0.0
+        calc_vol = (
+            float(group["calculated_volume"].sum())
+            if "calculated_volume" in group.columns and not is_aerobic
+            else 0.0
+        )
+        unique_modes = [str(m).strip() for m in group["mode"].dropna().unique() if str(m).strip()]
+        mode_repr = ", ".join(unique_modes) if unique_modes else "通常"
+        exercise_name = str(group["name"].iloc[0])
+
+        records.append(
+            {
+                "date_str": str(date_str),
+                "timestamp": group["timestamp"].max(),
+                "name": exercise_name,
+                "load": max_load,
+                "volume": total_vol,
+                "mode": mode_repr,
+                "calculated_volume": calc_vol,
+                "set_count": len(group),
+            }
+        )
+
+    return pd.DataFrame(records)
+
+
+def extract_selected_date(event: object, param_name: str = "date_selection") -> str | None:
+    """Extract selected date string from Streamlit Altair event payload.
+
+    Args:
+        event: Selection event returned by st.altair_chart with on_select='rerun'.
+        param_name: Altair selection parameter identifier.
+
+    Returns:
+        str | None: Selected date in 'YYYY-MM-DD' format, or None if unselected.
+    """
+    if not event or not hasattr(event, "selection"):
+        return None
+
+    selection_dict = getattr(event, "selection", None)
+    if selection_dict is None or not hasattr(selection_dict, "get"):
+        return None
+
+    selected_points = selection_dict.get(param_name, [])
+    if not isinstance(selected_points, list) or not selected_points:
+        return None
+
+    first_point = selected_points[0]
+    if not isinstance(first_point, dict):
+        return None
+
+    raw_val = first_point.get("date_str") or first_point.get("timestamp") or first_point.get("date")
+    if raw_val is None:
+        return None
+
+    if isinstance(raw_val, str):
+        return raw_val[:10]
+    if isinstance(raw_val, (int, float)):
+        return pd.to_datetime(raw_val, unit="ms").strftime("%Y-%m-%d")
+
+    return None
+
+
+def render_strength_chart(
+    df: pd.DataFrame, selection_name: str = "date_selection"
+) -> alt.LayerChart:
+    """Build modern dual-axis Altair chart for daily aggregated resistance training.
+
+    Args:
+        df: Daily aggregated dataframe for the selected exercise.
+        selection_name: Identifier for Altair selection point parameter.
+
+    Returns:
+        alt.LayerChart: Layered chart resolving independent Y axes with selection support.
+    """
+    chart_df = df.copy()
+    if "date_str" not in chart_df.columns:
+        if "timestamp" in chart_df.columns:
+            chart_df["date_str"] = pd.to_datetime(chart_df["timestamp"]).dt.strftime("%Y-%m-%d")
+        else:
+            chart_df["date_str"] = chart_df.index.astype(str)
+
+    select_date = alt.selection_point(name=selection_name, fields=["date_str"])
+
+    base = alt.Chart(chart_df).encode(
         x=alt.X(
-            "timestamp:T",
-            title="記録日時",
-            axis=alt.Axis(format="%Y-%m-%d %H:%M", labelAngle=-30, grid=False),
+            "date_str:N",
+            title="実施日",
+            axis=alt.Axis(labelAngle=-30, grid=False),
         )
     )
 
     # Volume bar chart (Right Y-axis, sleek modern indigo)
     bar = base.mark_bar(
-        opacity=0.3,
-        color="#6366F1",
-        size=16,
+        size=18,
         cornerRadiusTopLeft=4,
         cornerRadiusTopRight=4,
     ).encode(
         y=alt.Y(
-            "calculated_volume:Q",
-            title="総ボリューム (負荷 × 回数) [kg]",
+            "volume:Q",
+            title="合計回数 (reps)",
             axis=alt.Axis(titleColor="#6366F1", grid=False),
         ),
+        color=alt.value("#6366F1"),
+        opacity=alt.condition(select_date, alt.value(0.85), alt.value(0.35)),
         tooltip=[
-            alt.Tooltip("timestamp:T", title="日時", format="%Y-%m-%d %H:%M"),
-            alt.Tooltip("load:Q", title="負荷 (kg)", format=".1f"),
-            alt.Tooltip("volume:Q", title="回数 (reps)", format=".0f"),
-            alt.Tooltip("calculated_volume:Q", title="ボリューム (kg)", format=".1f"),
+            alt.Tooltip("date_str:N", title="実施日"),
+            alt.Tooltip("volume:Q", title="合計回数 (reps)", format=".0f"),
+            alt.Tooltip("load:Q", title="最高重量 (kg)", format=".1f"),
+            alt.Tooltip("calculated_volume:Q", title="総ボリューム (kg)", format=".1f"),
+            alt.Tooltip("set_count:Q", title="セット数", format=".0f"),
             alt.Tooltip("mode:N", title="モード"),
         ],
     )
 
     # Load line chart with points (Left Y-axis, vibrant rose)
     line = base.mark_line(
-        point=alt.OverlayMarkDef(filled=True, size=60, color="#F43F5E"),
+        point=alt.OverlayMarkDef(filled=True, size=70, color="#F43F5E"),
         color="#F43F5E",
         strokeWidth=3,
         interpolate="monotone",
     ).encode(
         y=alt.Y(
             "load:Q",
-            title="負荷重量 (kg)",
+            title="最高重量 (kg)",
             scale=alt.Scale(zero=False),
             axis=alt.Axis(titleColor="#F43F5E"),
         ),
         tooltip=[
-            alt.Tooltip("timestamp:T", title="日時", format="%Y-%m-%d %H:%M"),
-            alt.Tooltip("load:Q", title="負荷 (kg)", format=".1f"),
-            alt.Tooltip("volume:Q", title="回数 (reps)", format=".0f"),
-            alt.Tooltip("calculated_volume:Q", title="ボリューム (kg)", format=".1f"),
+            alt.Tooltip("date_str:N", title="実施日"),
+            alt.Tooltip("volume:Q", title="合計回数 (reps)", format=".0f"),
+            alt.Tooltip("load:Q", title="最高重量 (kg)", format=".1f"),
+            alt.Tooltip("calculated_volume:Q", title="総ボリューム (kg)", format=".1f"),
+            alt.Tooltip("set_count:Q", title="セット数", format=".0f"),
             alt.Tooltip("mode:N", title="モード"),
         ],
     )
 
     chart = (
         alt.layer(bar, line)
+        .add_params(select_date)
         .resolve_scale(y="independent")
         .properties(
             width="container",
             height=440,
             title=alt.TitleParams(
-                text="重量・ボリューム推移（筋力トレーニング）",
+                text=("日次 重量・合計回数推移（筋力トレーニング） - バーをクリックして内訳を表示"),
                 fontSize=14,
                 color="#94A3B8",
             ),
@@ -248,73 +356,91 @@ def render_strength_chart(df: pd.DataFrame) -> alt.LayerChart:
     return cast(alt.LayerChart, chart)
 
 
-def render_aerobic_chart(df: pd.DataFrame) -> alt.LayerChart:
-    """Build modern dual-axis Altair chart for aerobic exercises (Heart Rate vs Duration).
+def render_aerobic_chart(
+    df: pd.DataFrame, selection_name: str = "date_selection"
+) -> alt.LayerChart:
+    """Build modern dual-axis Altair chart for daily aggregated aerobic exercises.
 
     Args:
-        df: Chronological dataframe for the selected exercise.
+        df: Daily aggregated dataframe for the selected exercise.
+        selection_name: Identifier for Altair selection point parameter.
 
     Returns:
-        alt.LayerChart: Layered chart resolving independent Y axes.
+        alt.LayerChart: Layered chart resolving independent Y axes with selection support.
     """
-    base = alt.Chart(df).encode(
+    chart_df = df.copy()
+    if "date_str" not in chart_df.columns:
+        if "timestamp" in chart_df.columns:
+            chart_df["date_str"] = pd.to_datetime(chart_df["timestamp"]).dt.strftime("%Y-%m-%d")
+        else:
+            chart_df["date_str"] = chart_df.index.astype(str)
+
+    select_date = alt.selection_point(name=selection_name, fields=["date_str"])
+
+    base = alt.Chart(chart_df).encode(
         x=alt.X(
-            "timestamp:T",
-            title="記録日時",
-            axis=alt.Axis(format="%Y-%m-%d %H:%M", labelAngle=-30, grid=False),
+            "date_str:N",
+            title="実施日",
+            axis=alt.Axis(labelAngle=-30, grid=False),
         )
     )
 
     # Duration bar chart (Right Y-axis, teal)
     bar = base.mark_bar(
-        opacity=0.35,
-        color="#14B8A6",
-        size=16,
+        size=18,
         cornerRadiusTopLeft=4,
         cornerRadiusTopRight=4,
     ).encode(
         y=alt.Y(
             "volume:Q",
-            title="運動時間 (min)",
+            title="合計運動時間 (min)",
             axis=alt.Axis(titleColor="#14B8A6", grid=False),
         ),
+        color=alt.value("#14B8A6"),
+        opacity=alt.condition(select_date, alt.value(0.85), alt.value(0.35)),
         tooltip=[
-            alt.Tooltip("timestamp:T", title="日時", format="%Y-%m-%d %H:%M"),
-            alt.Tooltip("load:Q", title="心拍数 (bpm)", format=".0f"),
-            alt.Tooltip("volume:Q", title="運動時間 (min)", format=".1f"),
+            alt.Tooltip("date_str:N", title="実施日"),
+            alt.Tooltip("load:Q", title="最高心拍数 (bpm)", format=".0f"),
+            alt.Tooltip("volume:Q", title="合計運動時間 (min)", format=".1f"),
+            alt.Tooltip("set_count:Q", title="セッション数", format=".0f"),
             alt.Tooltip("mode:N", title="モード"),
         ],
     )
 
     # Heart rate line chart (Left Y-axis, amber)
     line = base.mark_line(
-        point=alt.OverlayMarkDef(filled=True, size=60, color="#F59E0B"),
+        point=alt.OverlayMarkDef(filled=True, size=70, color="#F59E0B"),
         color="#F59E0B",
         strokeWidth=3,
         interpolate="monotone",
     ).encode(
         y=alt.Y(
             "load:Q",
-            title="心拍数 (bpm)",
+            title="最高心拍数 (bpm)",
             scale=alt.Scale(zero=False),
             axis=alt.Axis(titleColor="#F59E0B"),
         ),
         tooltip=[
-            alt.Tooltip("timestamp:T", title="日時", format="%Y-%m-%d %H:%M"),
-            alt.Tooltip("load:Q", title="心拍数 (bpm)", format=".0f"),
-            alt.Tooltip("volume:Q", title="運動時間 (min)", format=".1f"),
+            alt.Tooltip("date_str:N", title="実施日"),
+            alt.Tooltip("load:Q", title="最高心拍数 (bpm)", format=".0f"),
+            alt.Tooltip("volume:Q", title="合計運動時間 (min)", format=".1f"),
+            alt.Tooltip("set_count:Q", title="セッション数", format=".0f"),
             alt.Tooltip("mode:N", title="モード"),
         ],
     )
 
     chart = (
         alt.layer(bar, line)
+        .add_params(select_date)
         .resolve_scale(y="independent")
         .properties(
             width="container",
             height=440,
             title=alt.TitleParams(
-                text="心拍数・運動時間推移（有酸素トレーニング）",
+                text=(
+                    "日次 心拍数・合計運動時間推移（有酸素トレーニング） "
+                    "- バーをクリックして内訳を表示"
+                ),
                 fontSize=14,
                 color="#94A3B8",
             ),
@@ -495,57 +621,59 @@ def main() -> None:
     load_unit = "bpm" if is_aerobic else "kg"
     volume_unit = "min" if is_aerobic else "reps"
 
+    daily_df = aggregate_daily_logs(df, is_aerobic=is_aerobic)
+
     # 1. Header Metrics Card Section
     st.subheader(f"📊 {selected_exercise} のトレーニング実績")
-    latest_record = df.iloc[-1]
-    prev_record = df.iloc[-2] if len(df) >= 2 else None
+    latest_daily = daily_df.iloc[-1]
+    prev_daily = daily_df.iloc[-2] if len(daily_df) >= 2 else None
 
     col1, col2, col3, col4 = st.columns(4)
     with col1:
         st.metric(
-            label="直近セッション日時",
-            value=pd.to_datetime(latest_record["timestamp"]).strftime("%Y-%m-%d %H:%M"),
+            label="直近セッション実施日",
+            value=str(latest_daily["date_str"]),
         )
 
     with col2:
-        latest_load = latest_record["load"]
-        prev_load = prev_record["load"] if prev_record is not None else None
+        latest_load = latest_daily["load"]
+        prev_load = prev_daily["load"] if prev_daily is not None else None
         load_delta = (
             f"{latest_load - prev_load:+.1f} {load_unit}"
             if (prev_load is not None and pd.notna(latest_load) and pd.notna(prev_load))
             else None
         )
         st.metric(
-            label=f"直近負荷 ({load_unit})",
+            label=f"直近最高負荷 ({load_unit})",
             value=f"{latest_load:.1f}" if pd.notna(latest_load) else "-",
             delta=load_delta,
         )
 
     with col3:
-        latest_vol = latest_record["volume"]
-        prev_vol = prev_record["volume"] if prev_record is not None else None
+        latest_vol = latest_daily["volume"]
+        prev_vol = prev_daily["volume"] if prev_daily is not None else None
         vol_delta = (
             f"{latest_vol - prev_vol:+.1f} {volume_unit}"
             if (prev_vol is not None and pd.notna(latest_vol) and pd.notna(prev_vol))
             else None
         )
         st.metric(
-            label=f"直近量 ({volume_unit})",
+            label=f"直近合計量 ({volume_unit})",
             value=f"{latest_vol:.0f}" if pd.notna(latest_vol) else "-",
             delta=vol_delta,
         )
 
     with col4:
         if not is_aerobic:
-            latest_calc = latest_record["calculated_volume"]
-            prev_calc = prev_record["calculated_volume"] if prev_record is not None else None
+            latest_calc = latest_daily["calculated_volume"]
+            prev_calc = prev_daily["calculated_volume"] if prev_daily is not None else None
             calc_delta = (
                 f"{latest_calc - prev_calc:+.1f} kg"
                 if (prev_calc is not None and pd.notna(latest_calc) and pd.notna(prev_calc))
                 else None
             )
             st.metric(
-                label="直近ボリューム (kg)",
+                label="直近総ボリューム (kg)",
                 value=f"{latest_calc:.1f}" if pd.notna(latest_calc) else "-",
                 delta=calc_delta,
             )
@@ -560,8 +688,67 @@ def main() -> None:
     )
 
     with tab_chart:
-        chart = render_aerobic_chart(df) if is_aerobic else render_strength_chart(df)
-        st.altair_chart(chart, use_container_width=True)
+        chart = render_aerobic_chart(daily_df) if is_aerobic else render_strength_chart(daily_df)
+        chart_event = st.altair_chart(
+            chart,
+            use_container_width=True,
+            on_select="rerun",
+            key=f"workout_chart_{selected_exercise}_{selected_mode}_{selected_period}",
+        )
+
+        selected_date = extract_selected_date(chart_event)
+
+        st.divider()
+
+        # Drilldown table section
+        breakdown_df: pd.DataFrame
+        if selected_date:
+            breakdown_mask = df["timestamp"].dt.strftime("%Y-%m-%d") == selected_date
+            breakdown_df = df[breakdown_mask].copy()
+            st.subheader(f"📋 {selected_date} のトレーニング内訳 ({len(breakdown_df)} 件)")
+        else:
+            latest_date = str(daily_df["date_str"].iloc[-1]) if not daily_df.empty else None
+            if latest_date:
+                breakdown_mask = df["timestamp"].dt.strftime("%Y-%m-%d") == latest_date
+                breakdown_df = df[breakdown_mask].copy()
+                st.subheader(f"📋 直近セッション ({latest_date}) の内訳 ({len(breakdown_df)} 件)")
+                st.caption(
+                    "💡 グラフ上の日付バーまたはポイントをクリックすると、"
+                    "該当日のセット内訳が表示されます。"
+                )
+            else:
+                breakdown_df = pd.DataFrame()
+
+        if not breakdown_df.empty:
+            breakdown_display = breakdown_df.sort_values(by="timestamp", ascending=True).copy()
+            breakdown_cols = {
+                "timestamp": st.column_config.DatetimeColumn(
+                    "記録日時", format="YYYY-MM-DD HH:mm", width="medium"
+                ),
+                "name": st.column_config.TextColumn("種目名", width="medium"),
+                "load": st.column_config.NumberColumn(
+                    f"負荷 ({load_unit})", format=f"%.1f {load_unit}"
+                ),
+                "volume": st.column_config.NumberColumn(
+                    f"量 ({volume_unit})", format=f"%.0f {volume_unit}"
+                ),
+                "mode": st.column_config.TextColumn("モード", width="small"),
+                "calculated_volume": st.column_config.NumberColumn(
+                    "総ボリューム (kg)", format="%.1f kg"
+                ),
+            }
+            if is_aerobic:
+                breakdown_display = breakdown_display.drop(
+                    columns=["calculated_volume"], errors="ignore"
+                )
+                breakdown_cols.pop("calculated_volume", None)
+
+            st.dataframe(
+                breakdown_display,
+                column_config=breakdown_cols,
+                use_container_width=True,
+                hide_index=True,
+            )
 
     with tab_table:
         display_df = df.sort_values(by="timestamp", ascending=False).copy()
