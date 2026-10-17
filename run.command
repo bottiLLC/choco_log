@@ -90,21 +90,6 @@ fi
 echo "[INFO] Entry point found: $ENTRY_POINT"
 echo "[INFO] Working directory: $PROJ_ROOT"
 
-# Check write permission on data folder to avoid readonly SQLite database errors
-mkdir -p "$PROJ_ROOT/data" 2>/dev/null
-if ! touch "$PROJ_ROOT/data/.perm_check.tmp" 2>/dev/null; then
-    echo ""
-    echo "======================================================================="
-    echo "[WARNING] Project directory lacks write permissions!"
-    echo "Current location: $PROJ_ROOT"
-    echo "Writing to SQLite database in this directory will fail."
-    echo "Please move this project folder to a user-writable directory."
-    echo "======================================================================="
-    echo ""
-    read -p "Press [Enter] key to exit..."
-else
-    rm -f "$PROJ_ROOT/data/.perm_check.tmp" 2>/dev/null
-fi
 
 # 4. Auto-create .venv and sync package dependencies
 if [ ! -d ".venv" ]; then
