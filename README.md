@@ -6,20 +6,37 @@
 ![License](https://img.shields.io/badge/License-MIT-yellow.svg)
 
 ## Overview
-Googleスプレッドシートに蓄積されたワークアウトログ（重量・回数・心拍・時間）をCSV経由で取得し、ローカルSQLiteデータベースへアトミックに同期してAltairデュアル軸チャートで可視化するStreamlit製分析ダッシュボードです。
+Googleスプレッドシートに蓄積されたワークアウトログ（重量・回数・心拍・時間）の管理および可視化を行うプロジェクトです。
+本リポジトリでは、スプレッドシート連携・自動化を担当する **GAS (`gas/`)** と、ローカル分析・可視化を担当する **ダッシュボード (`dashboard/`)** を一元管理しています。
+
+## Repository Structure
+```text
+choco_log/
+├── dashboard/               # Streamlit分析ダッシュボード & SQLite ETL同期
+│   ├── app.py               # Streamlit メインUI
+│   ├── sync.py              # Googleスプレッドシート -> SQLite アトミックETL
+│   ├── backup_manager.py    # ./data ディレクトリ自動バックアップ
+│   ├── pyproject.toml       # Python 依存関係 & ツール設定
+│   ├── run.bat / run.command# ダッシュボード専用ワンクリック起動スクリプト
+│   └── tests/               # ユニットテスト (Pytest)
+├── gas/                     # Google Apps Script (GAS) 関連ソースコード
+│   └── README.md            # GAS環境構築・デプロイ手順
+├── run.bat                  # ルート用ワンクリック起動スクリプト (dashboardへ委譲)
+├── run.command              # ルート用ワンクリック起動シェル (dashboardへ委譲)
+└── .github/workflows/ci.yml # GitHub Actions CIパイプライン
+```
 
 ## Quick Start (TL;DR)
+### ダッシュボードの起動
+ルート直下の `run.bat` (Windows) または `run.command` (macOS/Linux) をダブルクリックするだけで、全自動で依存関係のセットアップからダッシュボードの起動まで行われます。
+
+CLIから直接起動する場合:
 ```bash
-# 1. 依存関係の同期（uv使用）
+cd dashboard
 uv sync
-
-# 2. 環境変数設定（スプレッドシートID）
 cp .env.example .env
-
-# 3. ダッシュボード起動
 uv run streamlit run app.py
 ```
-※ Windows環境では同梱の `run.bat`、macOS/Linux環境では `run.command` をダブルクリックするだけで全自動セットアップおよび起動が可能です。
 
 ## Architecture & Features
 - **アトミックETLパイプライン (`sync.py`)**: Google Visualization APIのエクスポートエンドポイントからログを取得し、ステージングテーブル経由のトランザクション置換で全量更新を実施（検索用複合インデックス自動構築）。
