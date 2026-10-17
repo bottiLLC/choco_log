@@ -3,10 +3,11 @@ from __future__ import annotations
 import argparse
 import os
 import sqlite3
+import stat
 import sys
 import urllib.error
 import urllib.request
-from contextlib import closing
+from contextlib import closing, suppress
 from pathlib import Path
 from typing import Final
 
@@ -179,6 +180,30 @@ def persist_dataframe_to_sqlite(df: pd.DataFrame, db_path: Path = DEFAULT_DB_PAT
     except OSError as e:
         raise SyncError(f"データベース配置ディレクトリの作成に失敗しました: {e!s}") from e
 
+    # Clear OS-level read-only attribute if set on existing database file
+    if db_path.exists():
+        with suppress(OSError):
+            os.chmod(db_path, stat.S_IWRITE | stat.S_IREAD)
+
+    # Pre-flight check: verify write permission on database file or parent directory
+    try:
+        if db_path.exists():
+            with open(db_path, "a"):
+                pass
+        else:
+            test_probe = db_path.parent / ".perm_check.tmp"
+            with open(test_probe, "w"):
+                pass
+            test_probe.unlink(missing_ok=True)
+    except PermissionError as e:
+        err_detail = e.strerror or str(e)
+        raise SyncError(
+            f"SQLiteデータベース更新エラー: 書き込み権限がありません ({err_detail})。"
+            f"対象パス: '{db_path}'。"
+            "保護されたフォルダ（管理者権限が必要なフォルダ等）に配置されている場合は、"
+            "書き込み権限のある一般ユーザーフォルダに移動するか管理者として実行してください。"
+        ) from e
+
     try:
         with closing(sqlite3.connect(db_path)) as conn:
             cursor = conn.cursor()
@@ -217,6 +242,15 @@ def persist_dataframe_to_sqlite(df: pd.DataFrame, db_path: Path = DEFAULT_DB_PAT
             cursor.execute(index_sql)
             conn.commit()
     except sqlite3.Error as e:
+        err_msg = str(e)
+        if "readonly" in err_msg.lower():
+            target_desc = f"'{db_path.name}' または配置先フォルダ '{db_path.parent}'"
+            raise SyncError(
+                f"SQLiteデータベース更新エラー: {err_msg}。"
+                f"データベースファイル {target_desc} に書き込み権限がありません。"
+                "保護されたフォルダ（管理者権限が必要なフォルダ等）に配置されている場合は、"
+                "書き込み権限のある一般ユーザーフォルダに移動するか管理者として実行してください。"
+            ) from e
         raise SyncError(f"SQLiteデータベース更新エラー: {e!s}") from e
 
     return len(df)

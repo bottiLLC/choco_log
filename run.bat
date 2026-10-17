@@ -97,6 +97,29 @@ cd /d "%PROJ_ROOT%"
 echo [INFO] Entry point found: %ENTRY_POINT%
 echo [INFO] Working directory: %PROJ_ROOT%
 
+:: Check write permission on data folder to avoid readonly SQLite database errors
+if not exist "%PROJ_ROOT%data" mkdir "%PROJ_ROOT%data" 2>nul
+copy /y nul "%PROJ_ROOT%data\.perm_check.tmp" >nul 2>&1
+if %errorlevel% neq 0 (
+    echo.
+    echo =======================================================================
+    echo [WARNING] Project directory lacks write permissions!
+    echo Current location: %PROJ_ROOT%
+    echo Writing to SQLite database in this directory will fail with:
+    echo   'attempt to write a readonly database'
+    echo.
+    echo Possible causes and solutions:
+    echo 1. The project is placed in a system-protected folder (e.g., Program Files,
+    echo    E:\Programs).
+    echo    - Move this project folder to a user directory (e.g., Desktop or Documents).
+    echo    - Or right-click 'run.bat' and choose 'Run as administrator'.
+    echo =======================================================================
+    echo.
+    pause
+) else (
+    del /f /q "%PROJ_ROOT%data\.perm_check.tmp" >nul 2>&1
+)
+
 :: 4. Auto-create .venv and sync package dependencies
 if not exist ".venv" (
     echo [INFO] Creating virtual environment...

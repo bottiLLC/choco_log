@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import os
 import sqlite3
+import stat
 from contextlib import closing
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -105,3 +107,79 @@ def test_sync_spreadsheet_to_sqlite_missing_id(monkeypatch: pytest.MonkeyPatch) 
     monkeypatch.delenv("SPREADSHEET_ID", raising=False)
     with pytest.raises(SyncError, match="スプレッドシートIDが指定されていません"):
         sync_spreadsheet_to_sqlite(spreadsheet_id=None)
+
+
+def test_persist_dataframe_to_sqlite_permission_error_existing(
+    temp_data_dir: Path, mock_csv_content: str
+) -> None:
+    """Verify SyncError with actionable message when existing db file lacks write permissions."""
+    db_file = temp_data_dir / "protected.db"
+    db_file.write_bytes(b"")
+    df = parse_and_clean_csv(mock_csv_content)
+
+    real_open = open
+
+    def fake_open(file: object, mode: str = "r", *args: object, **kwargs: object) -> object:
+        if str(file) == str(db_file) and "a" in mode:
+            raise PermissionError(13, "Permission denied")
+        return real_open(file, mode, *args, **kwargs)  # type: ignore[call-overload]
+
+    with (
+        patch("builtins.open", side_effect=fake_open),
+        pytest.raises(SyncError, match="書き込み権限がありません"),
+    ):
+        persist_dataframe_to_sqlite(df, db_path=db_file)
+
+
+def test_persist_dataframe_to_sqlite_permission_error_probe(
+    temp_data_dir: Path, mock_csv_content: str
+) -> None:
+    """Verify SyncError when non-existent db target directory rejects probe file creation."""
+    db_file = temp_data_dir / "subdir" / "new.db"
+    df = parse_and_clean_csv(mock_csv_content)
+
+    real_open = open
+
+    def fake_open(file: object, mode: str = "r", *args: object, **kwargs: object) -> object:
+        if ".perm_check.tmp" in str(file):
+            raise PermissionError(13, "Permission denied")
+        return real_open(file, mode, *args, **kwargs)  # type: ignore[call-overload]
+
+    with (
+        patch("builtins.open", side_effect=fake_open),
+        pytest.raises(SyncError, match="書き込み権限がありません"),
+    ):
+        persist_dataframe_to_sqlite(df, db_path=db_file)
+
+
+def test_persist_dataframe_to_sqlite_readonly_sqlite_error(
+    temp_data_dir: Path, mock_csv_content: str
+) -> None:
+    """Verify SyncError provides actionable diagnostic message when SQLite raises readonly error."""
+    db_file = temp_data_dir / "readonly.db"
+    df = parse_and_clean_csv(mock_csv_content)
+
+    with (
+        patch(
+            "sqlite3.connect",
+            side_effect=sqlite3.OperationalError("attempt to write a readonly database"),
+        ),
+        pytest.raises(SyncError, match="配置先フォルダ.*書き込み権限がありません"),
+    ):
+        persist_dataframe_to_sqlite(df, db_path=db_file)
+
+
+def test_persist_dataframe_to_sqlite_clears_readonly_attribute(
+    temp_data_dir: Path, mock_csv_content: str
+) -> None:
+    """Verify persist_dataframe_to_sqlite removes read-only attribute and succeeds."""
+    db_file = temp_data_dir / "ro_file.db"
+    db_file.write_bytes(b"")
+    os.chmod(db_file, stat.S_IREAD)
+
+    try:
+        df = parse_and_clean_csv(mock_csv_content)
+        count = persist_dataframe_to_sqlite(df, db_path=db_file)
+        assert count == 4
+    finally:
+        os.chmod(db_file, stat.S_IWRITE)
