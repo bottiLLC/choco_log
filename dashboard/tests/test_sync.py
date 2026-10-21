@@ -80,6 +80,13 @@ def test_parse_and_clean_csv_invalid_timestamps() -> None:
         parse_and_clean_csv(invalid_ts_csv)
 
 
+def test_parse_and_clean_csv_deduplicates_identical_rows(mock_csv_content: str) -> None:
+    """Verify parse_and_clean_csv removes duplicate rows with identical timestamp and name."""
+    duplicated_csv = mock_csv_content + "2026-03-01 10:00:00,チェストプレス,40,10,両手\n"
+    df = parse_and_clean_csv(duplicated_csv)
+    assert len(df) == 4
+
+
 def test_persist_dataframe_to_sqlite(temp_data_dir: Path, mock_csv_content: str) -> None:
     """Verify atomic persistence into SQLite and composite index creation."""
     db_file = temp_data_dir / "test_fitness.db"
@@ -187,6 +194,46 @@ def test_persist_dataframe_to_sqlite_interlock_and_force(temp_data_dir: Path) ->
         assert cursor.fetchone()[0] == 5
 
 
+def test_persist_dataframe_to_sqlite_buffer_mode(temp_data_dir: Path) -> None:
+    """Verify buffer mode allows incoming rows to decrease without triggering SyncInterlockError."""
+    db_file = temp_data_dir / "test_buffer_mode.db"
+
+    # Pre-populate with 25 records
+    csv_rows = ["timestamp,name,load,volume,mode"]
+    for i in range(25):
+        day = (i // 20) + 1
+        hour = i % 20
+        csv_rows.append(f"2026-01-{day:02d} {hour:02d}:00:00,種目_{i},10,10,通常")
+    large_csv = "\n".join(csv_rows)
+    large_df = parse_and_clean_csv(large_csv)
+    stats1 = persist_dataframe_to_sqlite(large_df, db_path=db_file)
+    assert stats1.total_db == 25
+
+    # Incoming dataset: 3 existing records (duplicates) + 2 new records = 5 records (< 50% of 25)
+    buffer_rows = [
+        "timestamp,name,load,volume,mode",
+        "2026-01-01 00:00:00,種目_0,10,10,通常",  # Duplicate (unchanged)
+        "2026-01-01 01:00:00,種目_1,10,10,通常",  # Duplicate (unchanged)
+        "2026-01-01 02:00:00,種目_2,10,10,通常",  # Duplicate (unchanged)
+        "2026-02-01 10:00:00,新種目_A,50,10,通常",  # New record
+        "2026-02-01 11:00:00,新種目_B,60,10,通常",  # New record
+    ]
+    buffer_df = parse_and_clean_csv("\n".join(buffer_rows))
+    assert len(buffer_df) == 5
+
+    # Ingest in buffer mode: bypass interlock, keep 25 records, insert 2, unchanged 3
+    stats2 = persist_dataframe_to_sqlite(buffer_df, db_path=db_file, allow_buffer_mode=True)
+    assert stats2.inserted == 2
+    assert stats2.updated == 0
+    assert stats2.unchanged == 3
+    assert stats2.total_db == 27
+
+    with closing(sqlite3.connect(db_file)) as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT COUNT(*) FROM workout_logs;")
+        assert cursor.fetchone()[0] == 27
+
+
 def test_schema_migration_from_legacy_table(temp_data_dir: Path, mock_csv_content: str) -> None:
     """Verify seamless migration of legacy workout_logs schema without record_id."""
     db_file = temp_data_dir / "legacy_fitness.db"
@@ -278,6 +325,24 @@ def test_sync_spreadsheet_to_sqlite_end_to_end(temp_data_dir: Path, mock_csv_con
         assert res2["success"] is True
         assert mock_backup.called
         assert "事前バックアップ作成済" in str(res2["message"])
+
+
+def test_sync_spreadsheet_to_sqlite_buffer_mode(temp_data_dir: Path, mock_csv_content: str) -> None:
+    """Verify sync_spreadsheet_to_sqlite with allow_buffer_mode enabled."""
+    db_file = temp_data_dir / "buffer_e2e.db"
+    mock_resp = MagicMock()
+    mock_resp.read.return_value = mock_csv_content.encode("utf-8")
+    mock_resp.__enter__.return_value = mock_resp
+
+    with patch("urllib.request.urlopen", return_value=mock_resp):
+        res = sync_spreadsheet_to_sqlite(
+            spreadsheet_id="test_sheet",
+            db_path=db_file,
+            allow_buffer_mode=True,
+            auto_backup=False,
+        )
+        assert res["success"] is True
+        assert "累積追記同期" in str(res["message"])
 
 
 def test_persist_dataframe_to_sqlite_permission_error_existing(

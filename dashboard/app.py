@@ -458,16 +458,41 @@ def confirm_sync_dialog(sheet_id: str) -> None:
     Args:
         sheet_id: Target Google Spreadsheet ID to sync from.
     """
-    st.write("スプレッドシートから最新データを取得し、差分更新（UPSERT）を実行します。")
-    st.caption("※ 取得件数が激減した場合は安全装置が作動し、既存データは自動保護されます。")
+    st.write("スプレッドシートから最新データを取得し、SQLiteへ同期します。")
 
-    force_full = st.checkbox(
-        "⚠️ 強制全量同期（激減保護を無効化して完全洗い替え）",
-        value=False,
-        help="スプレッドシート側で意図的に過去データを大幅削除した場合にのみチェックを入れてください。",
+    buffer_mode = st.checkbox(
+        "📥 累積追記モード（スプレッドシート側の過去ログ削除を許容）",
+        value=True,
+        help="スプレッドシートの行が削除・整理されていても、SQLite側のデータを保持したまま新しいレコードのみを安全に追記・同期します。",
     )
 
-    btn_label = "強制全量同期を実行する" if force_full else "差分同期を実行する"
+    force_full = False
+    if not buffer_mode:
+        force_full = st.checkbox(
+            "⚠️ 強制全量同期（激減保護を無効化して完全洗い替え）",
+            value=False,
+            help=(
+                "スプレッドシート側で意図的に過去データを大幅削除し、"
+                "SQLite側も同じ状態にリセットしたい場合にのみチェックを入れてください。"
+            ),
+        )
+        caption_interlock = (
+            "※ 取得件数が既存DBから激減した場合は安全装置が作動し、既存データは自動保護されます。"
+        )
+        st.caption(caption_interlock)
+    else:
+        caption_buffer = (
+            "※ スプシ側で過去ログを削除・アーカイブしても、SQLite側の履歴は永続保持されます。"
+        )
+        st.caption(caption_buffer)
+
+    if force_full:
+        btn_label = "強制全量同期を実行する"
+    elif buffer_mode:
+        btn_label = "累積追記同期を実行する"
+    else:
+        btn_label = "通常差分同期を実行する"
+
     if st.button(btn_label, type="primary", use_container_width=True):
         with st.status("スプレッドシートと同期中...", expanded=True) as status:
             try:
@@ -486,6 +511,7 @@ def confirm_sync_dialog(sheet_id: str) -> None:
                     cleaned_df,
                     db_path=DEFAULT_DB_PATH,
                     force_full_refresh=force_full,
+                    allow_buffer_mode=buffer_mode,
                 )
 
                 status.update(
@@ -504,8 +530,8 @@ def confirm_sync_dialog(sheet_id: str) -> None:
                 status.update(label="安全装置作動（同期中断）", state="error", expanded=True)
                 st.error(f"🚨 {e!s}")
                 msg_hint = (
-                    "意図したデータ削除の場合は、上の"
-                    "「⚠️ 強制全量同期」にチェックを入れて再実行してください。"
+                    "スプレッドシートの行を整理・削除した場合は、"
+                    "「累積追記モード」にチェックを入れて再実行してください。"
                 )
                 st.warning(msg_hint)
             except SyncError as e:

@@ -200,6 +200,9 @@ def parse_and_clean_csv(csv_text: str) -> pd.DataFrame:
         for ts, nm in zip(df["timestamp"], df["name"], strict=False)
     ]
 
+    # Deduplicate exact duplicate records within the incoming CSV itself
+    df = df.drop_duplicates(subset=["record_id"], keep="first").reset_index(drop=True)
+
     target_columns = [
         "record_id",
         "timestamp",
@@ -289,6 +292,7 @@ def persist_dataframe_to_sqlite(
     df: pd.DataFrame,
     db_path: Path = DEFAULT_DB_PATH,
     force_full_refresh: bool = False,
+    allow_buffer_mode: bool = False,
     drop_threshold_ratio: float = DROP_THRESHOLD_RATIO,
     min_records_for_interlock: int = MIN_RECORDS_FOR_INTERLOCK,
 ) -> SyncStats:
@@ -298,6 +302,7 @@ def persist_dataframe_to_sqlite(
         df: Cleaned dataframe to write.
         db_path: Target SQLite database file path.
         force_full_refresh: If True, bypasses interlock and replaces table entirely.
+        allow_buffer_mode: If True, permits incoming record decrease to allow spreadsheet clearing.
         drop_threshold_ratio: Ratio threshold below which interlock triggers.
         min_records_for_interlock: Minimum existing records required to enforce interlock.
 
@@ -350,9 +355,10 @@ def persist_dataframe_to_sqlite(
             existing_count = int(cursor.fetchone()[0])
             incoming_count = len(df)
 
-            # 3. Interlock: Protect against accidental deletion in Google Spreadsheet
+            # 3. Interlock: Protect against accidental deletion (unless buffer mode enabled)
             if (
-                not force_full_refresh
+                not allow_buffer_mode
+                and not force_full_refresh
                 and existing_count >= min_records_for_interlock
                 and incoming_count < int(existing_count * drop_threshold_ratio)
             ):
@@ -361,7 +367,7 @@ def persist_dataframe_to_sqlite(
                     f"安全装置（激減インターロック）が作動しました: "
                     f"スプレッドシート側の取得件数 ({incoming_count}件) が "
                     f"既存DB件数 ({existing_count}件) の {pct}% 未満に急減しています。"
-                    "誤削除の可能性があるため同期を中断しました。意図的な削除の場合は強制同期を実行してください。"
+                    "誤削除の可能性があるため同期を中断しました。意図的な削除の場合は強制同期または累積追記モードを実行してください。"
                 )
                 raise SyncInterlockError(msg)
 
@@ -480,6 +486,7 @@ def sync_spreadsheet_to_sqlite(
     sheet_name: str = DEFAULT_SHEET_NAME,
     db_path: Path = DEFAULT_DB_PATH,
     force_full_refresh: bool = False,
+    allow_buffer_mode: bool = False,
     auto_backup: bool = True,
 ) -> dict[str, object]:
     """Orchestrate end-to-end synchronization from Google Spreadsheet to SQLite.
@@ -489,6 +496,7 @@ def sync_spreadsheet_to_sqlite(
         sheet_name: Name of the sheet tab.
         db_path: Target SQLite file path.
         force_full_refresh: If True, executes full wipe and replaces all records.
+        allow_buffer_mode: If True, permits volume drop to support spreadsheet clearing.
         auto_backup: If True, triggers pre-sync ZIP backup of ./data before writing.
 
     Returns:
@@ -522,9 +530,16 @@ def sync_spreadsheet_to_sqlite(
         cleaned_df,
         db_path=db_path,
         force_full_refresh=force_full_refresh,
+        allow_buffer_mode=allow_buffer_mode,
     )
 
-    mode_label = "全量洗い替え" if force_full_refresh else "差分同期"
+    if force_full_refresh:
+        mode_label = "全量洗い替え"
+    elif allow_buffer_mode:
+        mode_label = "累積追記同期"
+    else:
+        mode_label = "差分同期"
+
     msg = (
         f"正常に{mode_label}を完了しました: 新規 {stats.inserted} 件, "
         f"更新 {stats.updated} 件, 維持 {stats.unchanged} 件 "
@@ -558,6 +573,11 @@ def main() -> None:
         action="store_true",
         help="Disable automatic pre-sync ZIP backup",
     )
+    parser.add_argument(
+        "--buffer-mode",
+        action="store_true",
+        help="Allow spreadsheet records to decrease or be cleared (accumulative buffer mode)",
+    )
     args = parser.parse_args()
 
     try:
@@ -566,6 +586,7 @@ def main() -> None:
             sheet_name=args.sheet_name,
             db_path=Path(args.db_path),
             force_full_refresh=args.force,
+            allow_buffer_mode=args.buffer_mode,
             auto_backup=not args.no_backup,
         )
         print(f"[SUCCESS] {result['message']}")
