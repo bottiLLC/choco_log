@@ -10,6 +10,10 @@ dependencies = [
     "pandas>=2.2.0",
     "altair>=5.4.0",
     "python-dotenv>=1.0.0",
+    "structlog>=26.1.0",
+    "tenacity>=9.2.1",
+    "pydantic>=2.14.1",
+    "pydantic-settings>=2.16.1",
 ]
 
 [project.optional-dependencies]
@@ -27,7 +31,11 @@ line-length = 100
 
 [tool.ruff.lint]
 select = ["E", "F", "W", "I", "N", "UP", "B", "A", "C4", "SIM", "ARG"]
-ignore = ["EXE002", "E402"]
+ignore = ["EXE002"]
+
+[tool.ruff.lint.per-file-ignores]
+"app.py" = ["E402"]
+"sync.py" = ["E402"]
 
 [tool.mypy]
 python_version = "3.13"

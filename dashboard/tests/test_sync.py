@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import sqlite3
 import stat
+import urllib.error
 from contextlib import closing
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -433,3 +434,63 @@ def test_persist_dataframe_to_sqlite_mkdir_oserror(
         pytest.raises(SyncError, match="データベース配置ディレクトリの作成に失敗しました"),
     ):
         persist_dataframe_to_sqlite(df, db_path=db_file)
+
+
+def test_sync_settings_defaults() -> None:
+    """Verify SyncSettings initializes deterministic default paths."""
+    from sync import SyncSettings
+
+    settings = SyncSettings()
+    assert settings.sheet_name == "Log"
+    assert settings.db_path.name == "choco_fitness.db"
+
+
+def test_workout_record_schema_validation() -> None:
+    """Verify WorkoutRecordSchema validates strictly and fails on invalid input."""
+    import pydantic
+
+    from sync import WorkoutRecordSchema
+
+    # Valid entry
+    valid = WorkoutRecordSchema(
+        record_id="0123456789abcdef",
+        timestamp="2026-03-01 10:00:00",
+        name="ベンチプレス",
+        load=80.0,
+        volume=10.0,
+        mode="通常",
+        calculated_volume=800.0,
+    )
+    assert valid.name == "ベンチプレス"
+
+    # Invalid timestamp format
+    with pytest.raises(pydantic.ValidationError):
+        WorkoutRecordSchema(
+            record_id="0123456789abcdef",
+            timestamp="invalid-time",
+            name="ベンチプレス",
+        )
+
+
+def test_fetch_csv_content_retry_on_urlerror() -> None:
+    """Verify fetch_csv_content retries on transient URLError and succeeds."""
+    mock_resp = MagicMock()
+    mock_resp.read.return_value = b"timestamp,name,load,volume\n"
+    mock_resp.__enter__.return_value = mock_resp
+
+    call_count = 0
+
+    def mock_urlopen(*_args: object, **_kwargs: object) -> MagicMock:
+        nonlocal call_count
+        call_count += 1
+        if call_count == 1:
+            raise urllib.error.URLError("Connection reset by peer")
+        return mock_resp
+
+    with (
+        patch("urllib.request.urlopen", side_effect=mock_urlopen),
+        patch("tenacity.nap.time.sleep", return_value=None),
+    ):
+        result = fetch_csv_content("https://dummy.url")
+        assert "timestamp,name,load,volume" in result
+        assert call_count == 2

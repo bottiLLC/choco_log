@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import io
 import os
 import sqlite3
 import stat
@@ -11,18 +12,25 @@ import urllib.request
 from contextlib import closing, suppress
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Final
-
-import pandas as pd
-from dotenv import load_dotenv
+from typing import Final, TypedDict
 
 # Deterministic sys.path setup
 _ROOT = Path(__file__).resolve().parent
 if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
-# Load .env file relative to project root
-load_dotenv(_ROOT / ".env")
+import pandas as pd
+import structlog
+from pydantic import BaseModel, ConfigDict, Field
+from pydantic_settings import BaseSettings, SettingsConfigDict
+from tenacity import (
+    retry,
+    retry_if_exception,
+    stop_after_attempt,
+    wait_exponential,
+)
+
+logger = structlog.get_logger()
 
 DEFAULT_DB_PATH: Final[Path] = _ROOT / "data" / "choco_fitness.db"
 DEFAULT_SHEET_NAME: Final[str] = "Log"
@@ -39,6 +47,34 @@ class SyncInterlockError(SyncError):
     """Exception raised when safety invariants (e.g. abrupt record count drop) are violated."""
 
 
+class SyncSettings(BaseSettings):
+    """Settings model loaded deterministically from environment or .env file."""
+
+    model_config = SettingsConfigDict(
+        env_file=str(_ROOT / ".env"),
+        env_file_encoding="utf-8",
+        extra="ignore",
+    )
+
+    spreadsheet_id: str = Field(default="")
+    sheet_name: str = Field(default=DEFAULT_SHEET_NAME)
+    db_path: Path = Field(default=DEFAULT_DB_PATH)
+
+
+class WorkoutRecordSchema(BaseModel):
+    """Boundary validation model for individual workout entries."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    record_id: str = Field(min_length=16, max_length=16)
+    timestamp: str = Field(pattern=r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$")
+    name: str = Field(min_length=1)
+    load: float | None = None
+    volume: float | None = None
+    mode: str = ""
+    calculated_volume: float | None = None
+
+
 @dataclass(frozen=True, slots=True)
 class SyncStats:
     """Metrics container tracking incremental upsert outcomes."""
@@ -51,6 +87,15 @@ class SyncStats:
     def __int__(self) -> int:
         """Compatibility cast returning total active database records."""
         return self.total_db
+
+
+class SyncResult(TypedDict):
+    """Typed dictionary contract for sync execution output."""
+
+    success: bool
+    count: int
+    stats: SyncStats
+    message: str
 
 
 def generate_record_id(timestamp: str, name: str) -> str:
@@ -82,6 +127,26 @@ def build_csv_url(spreadsheet_id: str, sheet_name: str = DEFAULT_SHEET_NAME) -> 
     return f"{base_url}/{clean_id}/gviz/tq?tqx=out:csv&sheet={sheet_name}"
 
 
+def _is_transient_network_error(exc: BaseException) -> bool:
+    """Determine whether a network exception qualifies for retry."""
+    if isinstance(exc, urllib.error.HTTPError):
+        # Retry only server errors or rate limits, never auth/redirects
+        return exc.code in (408, 429, 500, 502, 503, 504)
+    return isinstance(exc, (urllib.error.URLError, TimeoutError))
+
+
+@retry(
+    retry=retry_if_exception(_is_transient_network_error),
+    wait=wait_exponential(min=2, max=10),
+    stop=stop_after_attempt(3),
+    reraise=True,
+)
+def _download_url_bytes(req: urllib.request.Request, timeout: int) -> bytes:
+    """Download binary payload with exponential backoff for transient faults."""
+    with urllib.request.urlopen(req, timeout=timeout) as response:
+        return response.read()  # type: ignore[no-any-return]
+
+
 def fetch_csv_content(url: str, timeout: int = REQUEST_TIMEOUT_SECONDS) -> str:
     """Download raw CSV text from Google Visualization API endpoint.
 
@@ -102,10 +167,10 @@ def fetch_csv_content(url: str, timeout: int = REQUEST_TIMEOUT_SECONDS) -> str:
     req = urllib.request.Request(url, headers=headers)
 
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as response:
-            content_bytes: bytes = response.read()
-            text: str = content_bytes.decode("utf-8", errors="replace")
+        content_bytes = _download_url_bytes(req, timeout=timeout)
+        text: str = content_bytes.decode("utf-8", errors="replace")
     except urllib.error.HTTPError as e:
+        logger.error("spreadsheet_http_error", code=e.code, reason=e.reason)
         if e.code in (401, 403, 302):
             msg = (
                 f"スプレッドシートへのアクセス権限がありません（HTTP {e.code}）。"
@@ -114,13 +179,16 @@ def fetch_csv_content(url: str, timeout: int = REQUEST_TIMEOUT_SECONDS) -> str:
             raise SyncError(msg) from e
         raise SyncError(f"スプレッドシートの取得に失敗しました（HTTP {e.code}: {e.reason}）") from e
     except urllib.error.URLError as e:
+        logger.error("spreadsheet_url_error", reason=str(e.reason))
         raise SyncError(f"スプレッドシート接続エラー: {e.reason}") from e
     except TimeoutError as e:
+        logger.error("spreadsheet_timeout_error")
         msg = "スプレッドシート取得がタイムアウトしました。通信環境を確認してください。"
         raise SyncError(msg) from e
 
     # Interlock: Detect Google login redirect page delivered as text/html
     if "<html" in text.lower() or "accounts.google.com" in text or "servicelogin" in text.lower():
+        logger.error("spreadsheet_login_redirect_intercepted")
         raise SyncError(
             "スプレッドシートが非公開またはログイン保護されています。"
             "共有設定を「リンクを知っている全員（閲覧可）」に設定してください。"
@@ -141,8 +209,6 @@ def parse_and_clean_csv(csv_text: str) -> pd.DataFrame:
     Raises:
         SyncError: When required columns are missing or parsing fails completely.
     """
-    import io
-
     if not csv_text.strip():
         msg = "取得したCSVデータが空です。スプレッドシートにデータが存在するか確認してください。"
         raise SyncError(msg)
@@ -369,6 +435,12 @@ def persist_dataframe_to_sqlite(
                     f"既存DB件数 ({existing_count}件) の {pct}% 未満に急減しています。"
                     "誤削除の可能性があるため同期を中断しました。意図的な削除の場合は強制同期または累積追記モードを実行してください。"
                 )
+                logger.warning(
+                    "sync_interlock_triggered",
+                    existing=existing_count,
+                    incoming=incoming_count,
+                    threshold_ratio=drop_threshold_ratio,
+                )
                 raise SyncInterlockError(msg)
 
             # 4. Mode branch: Full wipe vs Incremental UPSERT
@@ -393,6 +465,7 @@ def persist_dataframe_to_sqlite(
                 ]
                 cursor.executemany(insert_sql, records)
                 conn.commit()
+                logger.info("sync_full_refresh_complete", records=incoming_count)
                 return SyncStats(
                     inserted=incoming_count,
                     updated=0,
@@ -459,6 +532,13 @@ def persist_dataframe_to_sqlite(
             conn.commit()
 
             unchanged_count = max(0, incoming_count - (inserted_count + updated_count))
+            logger.info(
+                "sync_upsert_complete",
+                inserted=inserted_count,
+                updated=updated_count,
+                unchanged=unchanged_count,
+                total_db=total_db_count,
+            )
             return SyncStats(
                 inserted=inserted_count,
                 updated=updated_count,
@@ -470,6 +550,7 @@ def persist_dataframe_to_sqlite(
         raise
     except sqlite3.Error as e:
         err_msg = str(e)
+        logger.error("sqlite_persistence_error", error=err_msg)
         if "readonly" in err_msg.lower():
             target_desc = f"'{db_path.name}' または配置先フォルダ '{db_path.parent}'"
             raise SyncError(
@@ -488,7 +569,7 @@ def sync_spreadsheet_to_sqlite(
     force_full_refresh: bool = False,
     allow_buffer_mode: bool = False,
     auto_backup: bool = True,
-) -> dict[str, object]:
+) -> SyncResult:
     """Orchestrate end-to-end synchronization from Google Spreadsheet to SQLite.
 
     Args:
@@ -500,13 +581,16 @@ def sync_spreadsheet_to_sqlite(
         auto_backup: If True, triggers pre-sync ZIP backup of ./data before writing.
 
     Returns:
-        dict[str, object]: Success flag, synced record count, stats, and receipt message.
+        SyncResult: Success flag, synced record count, stats, and receipt message.
 
     Raises:
         SyncError: On missing configuration or pipeline failure.
         SyncInterlockError: On volume drop detection.
     """
-    target_id = spreadsheet_id or os.getenv("SPREADSHEET_ID")
+    target_id: str | None = spreadsheet_id
+    if target_id is None:
+        target_id = os.getenv("SPREADSHEET_ID")
+
     if not target_id or not target_id.strip():
         msg = (
             "スプレッドシートIDが指定されていません。"
@@ -589,9 +673,9 @@ def main() -> None:
             allow_buffer_mode=args.buffer_mode,
             auto_backup=not args.no_backup,
         )
-        print(f"[SUCCESS] {result['message']}")
+        logger.info("cli_sync_success", message=result["message"])
     except SyncError as e:
-        print(f"[ERROR] {e!s}", file=sys.stderr)
+        logger.error("cli_sync_failure", error=str(e))
         sys.exit(1)
 
 

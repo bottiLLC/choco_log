@@ -7,11 +7,30 @@ import tempfile
 import zipfile
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Final, TypedDict
 
-_ROOT = Path(__file__).resolve().parent
-_DATA_DIR = _ROOT / "data"
-_CONFIG_FILE = _DATA_DIR / "backup_config.json"
-_DEFAULT_BACKUP_DIR = _ROOT / "backups"
+_ROOT: Final[Path] = Path(__file__).resolve().parent
+_DATA_DIR: Final[Path] = _ROOT / "data"
+_CONFIG_FILE: Final[Path] = _DATA_DIR / "backup_config.json"
+_DEFAULT_BACKUP_DIR: Final[Path] = _ROOT / "backups"
+
+
+class SetBackupDirResult(TypedDict):
+    """Result payload for setting backup directory."""
+
+    success: bool
+    message: str
+
+
+class BackupResult(TypedDict, total=False):
+    """Result payload for running data directory backup."""
+
+    success: bool
+    filename: str
+    size: str
+    destination: str
+    timestamp: str
+    message: str
 
 
 def get_backup_dir() -> Path:
@@ -37,14 +56,14 @@ def get_backup_dir() -> Path:
     return _DEFAULT_BACKUP_DIR.resolve()
 
 
-def set_backup_dir(target_dir: str) -> dict[str, str | bool]:
+def set_backup_dir(target_dir: str) -> SetBackupDirResult:
     """Persist custom backup destination configuration.
 
     Args:
         target_dir: Directory path string to store backups.
 
     Returns:
-        dict[str, str | bool]: Operation status and receipt message.
+        SetBackupDirResult: Operation status and receipt message.
     """
     path = Path(target_dir).resolve()
     # 1. Validate target destination directory
@@ -62,54 +81,46 @@ def set_backup_dir(target_dir: str) -> dict[str, str | bool]:
     except OSError as e:
         return {
             "success": False,
-            "message": f"保存先フォルダを作成できません: {e!s}",
+            "message": f"保存先フォルダの作成に失敗しました: {e!s}",
         }
 
-    # 2. Persist configuration to internal config file
+    # 2. Persist to configuration file
     try:
         _CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
         with open(_CONFIG_FILE, "w", encoding="utf-8") as f:
             json.dump({"backup_dir": str(path)}, f, indent=2)
-        return {"success": True, "message": f"バックアップ先を設定しました: {path!s}"}
-    except PermissionError as e:
-        return {
-            "success": False,
-            "message": (
-                f"内部設定ファイル ({_CONFIG_FILE}) への書き込み権限がありません。"
-                f"フォルダ権限を確認するか管理者権限で実行してください: {e!s}"
-            ),
-        }
     except OSError as e:
         return {
             "success": False,
-            "message": f"設定ファイルの書き込みに失敗しました: {e!s}",
+            "message": f"内部設定ファイルの書き込みに失敗しました（権限がありません）: {e!s}",
         }
+
+    return {"success": True, "message": f"バックアップ先を設定しました: {path!s}"}
 
 
 def run_backup(
     app_name: str = "app",
     source_dir: str | Path | None = None,
-) -> dict[str, str | bool]:
+) -> BackupResult:
     """Execute verified atomic ZIP backup of persistent data directory.
 
     Args:
-        app_name: Name prefix for generated backup archive.
-        source_dir: Source directory containing persistent files. Defaults to project ./data.
+        app_name: Identifier prefix used for backup archive filename.
+        source_dir: Directory path to backup. Defaults to standard _DATA_DIR.
 
     Returns:
-        dict[str, str | bool]: Verification metadata and receipt.
+        BackupResult: Status dictionary with archive metadata and integrity flag.
     """
-    source_path = Path(source_dir).resolve() if source_dir is not None else _DATA_DIR.resolve()
+    source_path = Path(source_dir).resolve() if source_dir else _DATA_DIR.resolve()
 
-    # 1. Interlock: Source presence
-    if not source_path.exists() or not any(source_path.iterdir()):
+    # 1. Verify existence of source data directory
+    if not source_path.exists() or not list(source_path.iterdir()):
         return {
             "success": False,
-            "message": f"バックアップ対象が存在しないか空欄です: {source_dir}",
-            "timestamp": datetime.now(UTC).astimezone().strftime("%Y-%m-%d %H:%M:%S"),
+            "message": f"バックアップ対象が存在しないか空欄です: {source_path!s}",
         }
 
-    # 2. Interlock: Destination resolution
+    # 2. Resolve destination path and prepare folder
     backup_dir = get_backup_dir()
     try:
         backup_dir.mkdir(parents=True, exist_ok=True)

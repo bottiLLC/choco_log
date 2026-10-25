@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import os
 import sqlite3
 import sys
 from contextlib import closing
@@ -8,33 +7,30 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Final, cast
 
-import altair as alt
-import pandas as pd
-import streamlit as st
-from dotenv import load_dotenv
-
 # Deterministic sys.path setup
 _ROOT = Path(__file__).resolve().parent
 if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
+
+import altair as alt
+import pandas as pd
+import streamlit as st
+import structlog
 
 from backup_manager import get_backup_dir, run_backup, set_backup_dir
 from sync import (
     DEFAULT_DB_PATH,
     SyncError,
     SyncInterlockError,
-    SyncStats,
-    build_csv_url,
-    fetch_csv_content,
-    parse_and_clean_csv,
-    persist_dataframe_to_sqlite,
+    SyncSettings,
+    sync_spreadsheet_to_sqlite,
 )
 
-# Load environment variables
-load_dotenv(_ROOT / ".env")
+logger = structlog.get_logger()
 
-DEFAULT_SPREADSHEET_ID: Final[str] = os.getenv(
-    "SPREADSHEET_ID", "1Q1FID9mYqSYUs8UQejVj82JS-qqHC79nQalSDbM7w2c"
+SETTINGS: Final[SyncSettings] = SyncSettings()
+DEFAULT_SPREADSHEET_ID: Final[str] = (
+    SETTINGS.spreadsheet_id or "1Q1FID9mYqSYUs8UQejVj82JS-qqHC79nQalSDbM7w2c"
 )
 
 AEROBIC_KEYWORDS: Final[tuple[str, ...]] = (
@@ -349,7 +345,7 @@ def render_strength_chart(
             width="container",
             height=440,
             title=alt.TitleParams(
-                text=("日次 重量・合計回数推移（筋力トレーニング） - バーをクリックして内訳を表示"),
+                text="日次 重量・合計回数推移（筋力トレーニング） - バーをクリックして内訳を表示",
                 fontSize=14,
                 color="#94A3B8",
             ),
@@ -461,7 +457,7 @@ def confirm_sync_dialog(sheet_id: str) -> None:
     st.write("スプレッドシートから最新データを取得し、SQLiteへ同期します。")
 
     buffer_mode = st.checkbox(
-        "📥 累積追記モード（スプレッドシート側の過去ログ削除を許容）",
+        "累積追記モード（スプレッドシート側の過去ログ削除を許容）",
         value=True,
         help="スプレッドシートの行が削除・整理されていても、SQLite側のデータを保持したまま新しいレコードのみを安全に追記・同期します。",
     )
@@ -469,7 +465,7 @@ def confirm_sync_dialog(sheet_id: str) -> None:
     force_full = False
     if not buffer_mode:
         force_full = st.checkbox(
-            "⚠️ 強制全量同期（激減保護を無効化して完全洗い替え）",
+            "強制全量同期（激減保護を無効化して完全洗い替え）",
             value=False,
             help=(
                 "スプレッドシート側で意図的に過去データを大幅削除し、"
@@ -493,25 +489,16 @@ def confirm_sync_dialog(sheet_id: str) -> None:
     else:
         btn_label = "通常差分同期を実行する"
 
-    if st.button(btn_label, type="primary", use_container_width=True):
+    if st.button(btn_label, type="primary", width="stretch", icon=":material/sync:"):
         with st.status("スプレッドシートと同期中...", expanded=True) as status:
             try:
-                st.write("💾 事前スナップショットバックアップを作成中...")
-                run_backup(app_name="choco_presync", source_dir=DEFAULT_DB_PATH.parent)
-
-                st.write("📡 スプレッドシートからCSVデータを取得中...")
-                url = build_csv_url(sheet_id)
-                csv_text = fetch_csv_content(url)
-
-                st.write("🧹 データ型変換・バリデーション検証中...")
-                cleaned_df = parse_and_clean_csv(csv_text)
-
-                st.write("💾 SQLiteデータベースへ差分UPSERT更新中...")
-                stats: SyncStats = persist_dataframe_to_sqlite(
-                    cleaned_df,
+                result = sync_spreadsheet_to_sqlite(
+                    spreadsheet_id=sheet_id,
+                    sheet_name=SETTINGS.sheet_name,
                     db_path=DEFAULT_DB_PATH,
                     force_full_refresh=force_full,
                     allow_buffer_mode=buffer_mode,
+                    auto_backup=True,
                 )
 
                 status.update(
@@ -520,15 +507,11 @@ def confirm_sync_dialog(sheet_id: str) -> None:
                     expanded=False,
                 )
                 st.cache_data.clear()
-                receipt_msg = (
-                    f"✅ 正常に同期しました！ (新規: {stats.inserted}件 / "
-                    f"更新: {stats.updated}件 / 維持: {stats.unchanged}件 / 計: {stats.total_db}件)"
-                )
-                st.toast(receipt_msg, icon="🏋️")
+                st.toast(result["message"], icon=":material/check_circle:")
                 st.rerun()
             except SyncInterlockError as e:
                 status.update(label="安全装置作動（同期中断）", state="error", expanded=True)
-                st.error(f"🚨 {e!s}")
+                st.error(f"{e!s}")
                 msg_hint = (
                     "スプレッドシートの行を整理・削除した場合は、"
                     "「累積追記モード」にチェックを入れて再実行してください。"
@@ -542,63 +525,310 @@ def confirm_sync_dialog(sheet_id: str) -> None:
 @st.fragment
 def render_sync_section() -> None:
     """Render isolated reactive sync form widget inside sidebar."""
-    st.header("⚙️ データ同期設定")
-    with st.form("sync_form", clear_on_submit=False):
-        sheet_id_input = st.text_input(
-            "スプレッドシートID",
-            value=DEFAULT_SPREADSHEET_ID,
-            help="GoogleスプレッドシートのURLに含まれるID（共有設定：リンクを知っている全員が閲覧可）。",
-        )
-        submit_sync = st.form_submit_button("今すぐスプシから最新データを同期", type="primary")
+    with st.container(border=True):
+        st.subheader("データ同期設定")
+        with st.form("sync_form", border=False, clear_on_submit=False):
+            sheet_id_input = st.text_input(
+                "スプレッドシートID",
+                value=DEFAULT_SPREADSHEET_ID,
+                help="GoogleスプレッドシートのURLに含まれるID（共有設定：リンクを知っている全員が閲覧可）。",
+            )
+            submit_sync = st.form_submit_button(
+                "今すぐスプシから最新データを同期",
+                type="primary",
+                width="stretch",
+                icon=":material/cloud_download:",
+            )
 
-    if submit_sync:
-        clean_id = sheet_id_input.strip()
-        if not clean_id:
-            st.error("スプレッドシートIDを入力してください。")
-        else:
-            confirm_sync_dialog(clean_id)
+        if submit_sync:
+            clean_id = sheet_id_input.strip()
+            if not clean_id:
+                st.error("スプレッドシートIDを入力してください。")
+            else:
+                confirm_sync_dialog(clean_id)
 
 
 @st.fragment
 def render_backup_section() -> None:
     """Render isolated reactive data protection and backup widget inside sidebar."""
+    with st.container(border=True):
+        st.subheader("データ保護・バックアップ")
+
+        current_dir = str(get_backup_dir())
+        new_dir = st.text_input("保存先フォルダ", value=current_dir)
+        if new_dir != current_dir and st.button(
+            "保存先パスを更新",
+            width="stretch",
+            icon=":material/folder_open:",
+        ):
+            save_res = set_backup_dir(new_dir)
+            if save_res["success"]:
+                st.toast("バックアップ保存先を更新しました", icon=":material/check_circle:")
+                st.rerun()
+            else:
+                st.error(str(save_res["message"]))
+
+        if st.button(
+            "今すぐバックアップを実行",
+            width="stretch",
+            icon=":material/save:",
+        ):
+            with st.spinner("圧縮・整合性検証中..."):
+                backup_res = run_backup(
+                    app_name="choco_fitness",
+                    source_dir=str(_ROOT / "data"),
+                )
+            if backup_res["success"]:
+                st.caption(f"完了日時: {backup_res.get('timestamp', '-')}")
+                st.caption(f"保存先: {backup_res.get('destination', '-')}")
+                st.toast("バックアップが完了しました！", icon=":material/check_circle:")
+            else:
+                st.error(str(backup_res.get("message", "バックアップに失敗しました")))
+
+
+def render_kpi_cards(
+    daily_df: pd.DataFrame,
+    is_aerobic: bool,
+    load_unit: str,
+    volume_unit: str,
+) -> tuple[float, float | None]:
+    """Render metric cards formatted with borders inside an equal columns container.
+
+    Returns:
+        tuple[float, float | None]: Latest load and first recorded load for growth metrics.
+    """
+    latest_daily = daily_df.iloc[-1]
+    prev_daily = daily_df.iloc[-2] if len(daily_df) >= 2 else None
+
+    col1, col2, col3, col4 = st.columns(4)
+    with col1:
+        st.metric(
+            label="直近セッション実施日",
+            value=str(latest_daily["date_str"]),
+            border=True,
+        )
+
+    with col2:
+        latest_load = float(latest_daily["load"])
+        prev_load = float(prev_daily["load"]) if prev_daily is not None else None
+        load_delta = (
+            f"{latest_load - prev_load:+.1f} {load_unit}"
+            if (prev_load is not None and pd.notna(latest_load) and pd.notna(prev_load))
+            else None
+        )
+        st.metric(
+            label=f"直近最高負荷 ({load_unit})",
+            value=f"{latest_load:.1f}" if pd.notna(latest_load) else "-",
+            delta=load_delta,
+            border=True,
+        )
+
+    with col3:
+        latest_vol = float(latest_daily["volume"])
+        prev_vol = float(prev_daily["volume"]) if prev_daily is not None else None
+        vol_delta = (
+            f"{latest_vol - prev_vol:+.1f} {volume_unit}"
+            if (prev_vol is not None and pd.notna(latest_vol) and pd.notna(prev_vol))
+            else None
+        )
+        st.metric(
+            label=f"直近合計量 ({volume_unit})",
+            value=f"{latest_vol:.0f}" if pd.notna(latest_vol) else "-",
+            delta=vol_delta,
+            border=True,
+        )
+
+    with col4:
+        if not is_aerobic:
+            latest_calc = float(latest_daily["calculated_volume"])
+            prev_calc = float(prev_daily["calculated_volume"]) if prev_daily is not None else None
+            calc_delta = (
+                f"{latest_calc - prev_calc:+.1f} kg"
+                if (prev_calc is not None and pd.notna(latest_calc) and pd.notna(prev_calc))
+                else None
+            )
+            st.metric(
+                label="直近総ボリューム (kg)",
+                value=f"{latest_calc:.1f}" if pd.notna(latest_calc) else "-",
+                delta=calc_delta,
+                border=True,
+            )
+        else:
+            st.metric(
+                label="種目分類",
+                value="有酸素運動",
+                border=True,
+            )
+
+    return latest_load, float(daily_df.iloc[0]["load"]) if len(daily_df) > 0 else None
+
+
+def render_chart_tab(
+    daily_df: pd.DataFrame,
+    df: pd.DataFrame,
+    is_aerobic: bool,
+    load_unit: str,
+    volume_unit: str,
+    selected_exercise: str,
+    selected_mode: str,
+    selected_period: str,
+) -> None:
+    """Render the primary interactive chart and drilldown breakdown list."""
+    chart = render_aerobic_chart(daily_df) if is_aerobic else render_strength_chart(daily_df)
+    chart_event = st.altair_chart(
+        chart,
+        width="stretch",
+        on_select="rerun",
+        key=f"workout_chart_{selected_exercise}_{selected_mode}_{selected_period}",
+    )
+
+    selected_date = extract_selected_date(chart_event)
     st.divider()
-    st.subheader("データ保護・バックアップ")
 
-    current_dir = str(get_backup_dir())
-    new_dir = st.text_input("保存先フォルダ", value=current_dir)
-    if new_dir != current_dir and st.button("保存先パスを更新", use_container_width=True):
-        save_res = set_backup_dir(new_dir)
-        if save_res["success"]:
-            st.success(str(save_res["message"]))
-            st.toast("バックアップ保存先を更新しました", icon="📁")
-            st.rerun()
+    # Drilldown table section
+    breakdown_df: pd.DataFrame
+    if selected_date:
+        breakdown_mask = df["timestamp"].dt.strftime("%Y-%m-%d") == selected_date
+        breakdown_df = df[breakdown_mask].copy()
+        st.subheader(f"📋 {selected_date} のトレーニング内訳 ({len(breakdown_df)} 件)")
+    else:
+        latest_date = str(daily_df["date_str"].iloc[-1]) if not daily_df.empty else None
+        if latest_date:
+            breakdown_mask = df["timestamp"].dt.strftime("%Y-%m-%d") == latest_date
+            breakdown_df = df[breakdown_mask].copy()
+            st.subheader(f"📋 直近セッション ({latest_date}) の内訳 ({len(breakdown_df)} 件)")
+            st.caption(
+                "💡 グラフ上の日付バーまたはポイントをクリックすると、"
+                "該当日のセット内訳が表示されます。"
+            )
         else:
-            st.error(str(save_res["message"]))
+            breakdown_df = pd.DataFrame()
 
-    if st.button("今すぐバックアップを実行", use_container_width=True):
-        with st.spinner("圧縮・整合性検証中..."):
-            backup_res = run_backup(app_name="choco_fitness", source_dir=str(_ROOT / "data"))
-        if backup_res["success"]:
-            st.success(str(backup_res["message"]))
-            st.caption(f"完了日時: {backup_res['timestamp']}")
-            st.caption(f"保存先: {backup_res['destination']}")
-            st.toast("バックアップが完了しました！", icon="💾")
+    if not breakdown_df.empty:
+        breakdown_display = breakdown_df.sort_values(by="timestamp", ascending=True).copy()
+        breakdown_cols = {
+            "timestamp": st.column_config.DatetimeColumn(
+                "記録日時", format="YYYY-MM-DD HH:mm", width="medium"
+            ),
+            "name": st.column_config.TextColumn("種目名", width="medium"),
+            "load": st.column_config.NumberColumn(
+                f"負荷 ({load_unit})", format=f"%.1f {load_unit}"
+            ),
+            "volume": st.column_config.NumberColumn(
+                f"量 ({volume_unit})", format=f"%.0f {volume_unit}"
+            ),
+            "mode": st.column_config.TextColumn("モード", width="small"),
+            "calculated_volume": st.column_config.NumberColumn(
+                "総ボリューム (kg)", format="%.1f kg"
+            ),
+        }
+        if is_aerobic:
+            breakdown_display = breakdown_display.drop(
+                columns=["calculated_volume"], errors="ignore"
+            )
+            breakdown_cols.pop("calculated_volume", None)
+
+        st.dataframe(
+            breakdown_display,
+            column_config=breakdown_cols,
+            width="stretch",
+            hide_index=True,
+        )
+
+
+def render_history_tab(
+    df: pd.DataFrame,
+    is_aerobic: bool,
+    load_unit: str,
+    volume_unit: str,
+) -> None:
+    """Render historical chronological table for the active exercise."""
+    display_df = df.sort_values(by="timestamp", ascending=False).copy()
+    column_configs = {
+        "timestamp": st.column_config.DatetimeColumn(
+            "記録日時", format="YYYY-MM-DD HH:mm", width="medium"
+        ),
+        "name": st.column_config.TextColumn("種目名", width="medium"),
+        "load": st.column_config.NumberColumn(f"負荷 ({load_unit})", format=f"%.1f {load_unit}"),
+        "volume": st.column_config.NumberColumn(
+            f"量 ({volume_unit})", format=f"%.0f {volume_unit}"
+        ),
+        "mode": st.column_config.TextColumn("モード", width="small"),
+        "calculated_volume": st.column_config.NumberColumn("総ボリューム (kg)", format="%.1f kg"),
+    }
+
+    if is_aerobic:
+        display_df = display_df.drop(columns=["calculated_volume"], errors="ignore")
+        column_configs.pop("calculated_volume", None)
+
+    st.dataframe(
+        display_df,
+        column_config=column_configs,
+        width="stretch",
+        hide_index=True,
+    )
+
+
+def render_stats_tab(
+    df: pd.DataFrame,
+    is_aerobic: bool,
+    load_unit: str,
+    latest_load: float,
+    first_load: float | None,
+) -> None:
+    """Render aggregate personal records and stats panel."""
+    s_col1, s_col2, s_col3, s_col4 = st.columns(4)
+    with s_col1:
+        st.metric("総セッション数", f"{len(df)} 回", border=True)
+
+    max_load = df["load"].max()
+    with s_col2:
+        st.metric(
+            f"最高記録 ({load_unit})",
+            f"{max_load:.1f} {load_unit}" if pd.notna(max_load) else "-",
+            border=True,
+        )
+
+    with s_col3:
+        if not is_aerobic:
+            max_vol = df["calculated_volume"].max()
+            st.metric(
+                "最高ボリューム",
+                f"{max_vol:.1f} kg" if pd.notna(max_vol) else "-",
+                border=True,
+            )
         else:
-            st.error(str(backup_res["message"]))
+            max_duration = df["volume"].max()
+            st.metric(
+                "最長運動時間",
+                f"{max_duration:.0f} min" if pd.notna(max_duration) else "-",
+                border=True,
+            )
+
+    with s_col4:
+        if (
+            first_load is not None
+            and pd.notna(first_load)
+            and pd.notna(latest_load)
+            and first_load > 0
+        ):
+            growth_rate = ((latest_load - first_load) / first_load) * 100
+            st.metric("初回比 成長率", f"{growth_rate:+.1f} %", border=True)
+        else:
+            st.metric("初回比 成長率", "-", border=True)
 
 
 def main() -> None:
     """Render the main Streamlit application layout and reactive state."""
     st.set_page_config(
         page_title="ChocoLog Fitness",
-        page_icon="🏋️",
+        page_icon=":material/fitness_center:",
         layout="wide",
         initial_sidebar_state="expanded",
     )
 
     # Top Brand Header
-    st.title("🏋️ ChocoLog 運動ログ分析ダッシュボード")
+    st.title("ChocoLog 運動ログ分析ダッシュボード")
     st.caption("Googleスプレッドシート連携型 筋力・有酸素トレーニング推移分析ツール")
 
     db_path_str = str(DEFAULT_DB_PATH)
@@ -608,7 +838,7 @@ def main() -> None:
         render_sync_section()
 
         st.divider()
-        st.header("🔍 表示フィルタ")
+        st.header("表示フィルタ")
 
         available_exercises = load_available_exercises(db_path_str)
         selected_exercise: str | None = None
@@ -678,196 +908,50 @@ def main() -> None:
     daily_df = aggregate_daily_logs(df, is_aerobic=is_aerobic)
 
     # 1. Header Metrics Card Section
-    st.subheader(f"📊 {selected_exercise} のトレーニング実績")
-    latest_daily = daily_df.iloc[-1]
-    prev_daily = daily_df.iloc[-2] if len(daily_df) >= 2 else None
-
-    col1, col2, col3, col4 = st.columns(4)
-    with col1:
-        st.metric(
-            label="直近セッション実施日",
-            value=str(latest_daily["date_str"]),
-        )
-
-    with col2:
-        latest_load = latest_daily["load"]
-        prev_load = prev_daily["load"] if prev_daily is not None else None
-        load_delta = (
-            f"{latest_load - prev_load:+.1f} {load_unit}"
-            if (prev_load is not None and pd.notna(latest_load) and pd.notna(prev_load))
-            else None
-        )
-        st.metric(
-            label=f"直近最高負荷 ({load_unit})",
-            value=f"{latest_load:.1f}" if pd.notna(latest_load) else "-",
-            delta=load_delta,
-        )
-
-    with col3:
-        latest_vol = latest_daily["volume"]
-        prev_vol = prev_daily["volume"] if prev_daily is not None else None
-        vol_delta = (
-            f"{latest_vol - prev_vol:+.1f} {volume_unit}"
-            if (prev_vol is not None and pd.notna(latest_vol) and pd.notna(prev_vol))
-            else None
-        )
-        st.metric(
-            label=f"直近合計量 ({volume_unit})",
-            value=f"{latest_vol:.0f}" if pd.notna(latest_vol) else "-",
-            delta=vol_delta,
-        )
-
-    with col4:
-        if not is_aerobic:
-            latest_calc = latest_daily["calculated_volume"]
-            prev_calc = prev_daily["calculated_volume"] if prev_daily is not None else None
-            calc_delta = (
-                f"{latest_calc - prev_calc:+.1f} kg"
-                if (prev_calc is not None and pd.notna(latest_calc) and pd.notna(prev_calc))
-                else None
-            )
-            st.metric(
-                label="直近総ボリューム (kg)",
-                value=f"{latest_calc:.1f}" if pd.notna(latest_calc) else "-",
-                delta=calc_delta,
-            )
-        else:
-            st.metric(label="種目分類", value="有酸素運動")
+    st.subheader(f"{selected_exercise} のトレーニング実績")
+    latest_load, first_load = render_kpi_cards(
+        daily_df, is_aerobic=is_aerobic, load_unit=load_unit, volume_unit=volume_unit
+    )
 
     st.divider()
 
     # 2. Modern Tabbed Workspace Layout
     tab_chart, tab_table, tab_stats = st.tabs(
-        ["📈 経過推移チャート", "📋 過去ログ履歴一覧", "🏆 個人ベスト & 統計"]
+        [
+            ":material/show_chart: 経過推移チャート",
+            ":material/table_chart: 過去ログ履歴一覧",
+            ":material/emoji_events: 個人ベスト & 統計",
+        ]
     )
 
     with tab_chart:
-        chart = render_aerobic_chart(daily_df) if is_aerobic else render_strength_chart(daily_df)
-        chart_event = st.altair_chart(
-            chart,
-            use_container_width=True,
-            on_select="rerun",
-            key=f"workout_chart_{selected_exercise}_{selected_mode}_{selected_period}",
+        render_chart_tab(
+            daily_df=daily_df,
+            df=df,
+            is_aerobic=is_aerobic,
+            load_unit=load_unit,
+            volume_unit=volume_unit,
+            selected_exercise=selected_exercise,
+            selected_mode=selected_mode,
+            selected_period=selected_period,
         )
 
-        selected_date = extract_selected_date(chart_event)
-
-        st.divider()
-
-        # Drilldown table section
-        breakdown_df: pd.DataFrame
-        if selected_date:
-            breakdown_mask = df["timestamp"].dt.strftime("%Y-%m-%d") == selected_date
-            breakdown_df = df[breakdown_mask].copy()
-            st.subheader(f"📋 {selected_date} のトレーニング内訳 ({len(breakdown_df)} 件)")
-        else:
-            latest_date = str(daily_df["date_str"].iloc[-1]) if not daily_df.empty else None
-            if latest_date:
-                breakdown_mask = df["timestamp"].dt.strftime("%Y-%m-%d") == latest_date
-                breakdown_df = df[breakdown_mask].copy()
-                st.subheader(f"📋 直近セッション ({latest_date}) の内訳 ({len(breakdown_df)} 件)")
-                st.caption(
-                    "💡 グラフ上の日付バーまたはポイントをクリックすると、"
-                    "該当日のセット内訳が表示されます。"
-                )
-            else:
-                breakdown_df = pd.DataFrame()
-
-        if not breakdown_df.empty:
-            breakdown_display = breakdown_df.sort_values(by="timestamp", ascending=True).copy()
-            breakdown_cols = {
-                "timestamp": st.column_config.DatetimeColumn(
-                    "記録日時", format="YYYY-MM-DD HH:mm", width="medium"
-                ),
-                "name": st.column_config.TextColumn("種目名", width="medium"),
-                "load": st.column_config.NumberColumn(
-                    f"負荷 ({load_unit})", format=f"%.1f {load_unit}"
-                ),
-                "volume": st.column_config.NumberColumn(
-                    f"量 ({volume_unit})", format=f"%.0f {volume_unit}"
-                ),
-                "mode": st.column_config.TextColumn("モード", width="small"),
-                "calculated_volume": st.column_config.NumberColumn(
-                    "総ボリューム (kg)", format="%.1f kg"
-                ),
-            }
-            if is_aerobic:
-                breakdown_display = breakdown_display.drop(
-                    columns=["calculated_volume"], errors="ignore"
-                )
-                breakdown_cols.pop("calculated_volume", None)
-
-            st.dataframe(
-                breakdown_display,
-                column_config=breakdown_cols,
-                use_container_width=True,
-                hide_index=True,
-            )
-
     with tab_table:
-        display_df = df.sort_values(by="timestamp", ascending=False).copy()
-
-        column_configs = {
-            "timestamp": st.column_config.DatetimeColumn(
-                "記録日時", format="YYYY-MM-DD HH:mm", width="medium"
-            ),
-            "name": st.column_config.TextColumn("種目名", width="medium"),
-            "load": st.column_config.NumberColumn(
-                f"負荷 ({load_unit})", format=f"%.1f {load_unit}"
-            ),
-            "volume": st.column_config.NumberColumn(
-                f"量 ({volume_unit})", format=f"%.0f {volume_unit}"
-            ),
-            "mode": st.column_config.TextColumn("モード", width="small"),
-            "calculated_volume": st.column_config.NumberColumn(
-                "総ボリューム (kg)", format="%.1f kg"
-            ),
-        }
-
-        if is_aerobic:
-            display_df = display_df.drop(columns=["calculated_volume"], errors="ignore")
-            column_configs.pop("calculated_volume", None)
-
-        st.dataframe(
-            display_df,
-            column_config=column_configs,
-            use_container_width=True,
-            hide_index=True,
+        render_history_tab(
+            df=df,
+            is_aerobic=is_aerobic,
+            load_unit=load_unit,
+            volume_unit=volume_unit,
         )
 
     with tab_stats:
-        s_col1, s_col2, s_col3, s_col4 = st.columns(4)
-        with s_col1:
-            st.metric("総セッション数", f"{len(df)} 回")
-
-        max_load = df["load"].max()
-        with s_col2:
-            st.metric(
-                f"最高記録 ({load_unit})",
-                f"{max_load:.1f} {load_unit}" if pd.notna(max_load) else "-",
-            )
-
-        with s_col3:
-            if not is_aerobic:
-                max_vol = df["calculated_volume"].max()
-                st.metric(
-                    "最高ボリューム",
-                    f"{max_vol:.1f} kg" if pd.notna(max_vol) else "-",
-                )
-            else:
-                max_duration = df["volume"].max()
-                st.metric(
-                    "最長運動時間",
-                    f"{max_duration:.0f} min" if pd.notna(max_duration) else "-",
-                )
-
-        with s_col4:
-            first_load = df.iloc[0]["load"]
-            if pd.notna(first_load) and pd.notna(latest_load) and first_load > 0:
-                growth_rate = ((latest_load - first_load) / first_load) * 100
-                st.metric("初回比 成長率", f"{growth_rate:+.1f} %")
-            else:
-                st.metric("初回比 成長率", "-")
+        render_stats_tab(
+            df=df,
+            is_aerobic=is_aerobic,
+            load_unit=load_unit,
+            latest_load=latest_load,
+            first_load=first_load,
+        )
 
 
 if __name__ == "__main__":
