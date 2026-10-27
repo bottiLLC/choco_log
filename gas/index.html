@@ -23,16 +23,27 @@
             <div v-for="(item, idx) in items" :key="item.name" :class="{'opacity-40': !item.active}"
                 class="bg-slate-800 border border-slate-700 rounded-xl p-4 transition-all">
 
-                <div class="flex justify-between items-center mb-3">
-                    <span class="font-bold text-lg">{{ item.name }}</span>
-                    <button @click="item.active = !item.active"
-                        :class="item.active ? 'bg-amber-500 text-slate-950 font-bold' : 'bg-slate-700 text-slate-400'"
-                        class="px-3 py-1 rounded text-xs transition">
-                        {{ item.active ? 'やる' : 'パス' }}
-                    </button>
+                <!-- 種目ヘッダー（タップでチェック切り替え） -->
+                <div class="flex justify-between items-center cursor-pointer select-none py-1"
+                    @click="item.active = !item.active">
+                    <div class="flex items-center gap-3">
+                        <div :class="item.active ? 'bg-amber-400 border-amber-400 text-slate-950' : 'bg-slate-900 border-slate-600 text-transparent'"
+                            class="w-6 h-6 rounded-md border-2 flex items-center justify-center transition-colors shadow-sm flex-shrink-0">
+                            <svg class="w-4 h-4 fill-current stroke-current stroke-1" viewBox="0 0 20 20">
+                                <path fill-rule="evenodd" d="M16.707 5.293a1 1 0 010 1.414l-8 8a1 1 0 01-1.414 0l-4-4a1 1 0 011.414-1.414L8 12.586l7.293-7.293a1 1 0 011.414 0z" clip-rule="evenodd"/>
+                            </svg>
+                        </div>
+                        <span :class="item.active ? 'text-slate-100 font-bold' : 'text-slate-400 font-medium'" class="text-lg transition-colors">
+                            {{ item.name }}
+                        </span>
+                    </div>
+                    <span :class="item.active ? 'bg-amber-400/20 text-amber-400 border-amber-400/40' : 'bg-slate-800 text-slate-500 border-slate-700'"
+                        class="text-xs px-2.5 py-1 rounded-full border transition font-semibold">
+                        {{ item.active ? 'やる' : 'やらない' }}
+                    </span>
                 </div>
 
-                <div v-if="item.active" class="space-y-3">
+                <div v-if="item.active" class="space-y-3 mt-3">
                     <!-- モード切替（両足/片足など） -->
                     <div v-if="item.modes.length" class="flex gap-2">
                         <button v-for="m in item.modes" :key="m" @click="item.selectedMode = m"
@@ -92,21 +103,33 @@
                 onMounted(() => {
                     google.script.run
                         .withSuccessHandler(data => {
-                            items.value = data;
+                            // 初期値は全種目「やらない（未選択）」として確実に初期化
+                            items.value = (data || []).map(item => ({
+                                ...item,
+                                active: false
+                            }));
                             loading.value = false;
+                        })
+                        .withFailureHandler(err => {
+                            loading.value = false;
+                            alert('データの取得に失敗しました: ' + (err.message || err));
                         })
                         .getInitialData();
                 });
 
                 const submit = () => {
                     const target = items.value.filter(i => i.active);
-                    if (target.length === 0) return alert('記録対象がありません');
+                    if (target.length === 0) return alert('「やる」種目が選択されていません。実施する種目にチェックを入れてください。');
 
                     saving.value = true;
                     google.script.run
                         .withSuccessHandler(() => {
                             saving.value = false;
                             alert('保存完了！お疲れさん！');
+                        })
+                        .withFailureHandler(err => {
+                            saving.value = false;
+                            alert('保存に失敗しました: ' + (err.message || err));
                         })
                         .saveLogs(target);
                 };
